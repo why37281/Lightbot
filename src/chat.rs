@@ -26,6 +26,10 @@ use crate::trigger;
 
 // ---------- 前端事件 ----------
 
+/// 记忆管理说明:恒定的独立 system 消息(与开关无关,开关切换不影响缓存前缀)。
+/// ⚠️ 此文本内容改动会破坏缓存前缀,勿随意修改。
+pub const MEMORY_GUIDE: &str = "(你可以管理长期记忆:当你了解到值得长期记住的信息(用户偏好、重要事实、约定)时,在回复末尾用标记 [记忆:添加 内容] 写入;需要删除时用 [记忆:删除 内容片段]。不要写入临时性信息,每次只写最重要的。)";
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendEvent {
@@ -370,19 +374,19 @@ impl ChatCore {
             self.log("error", "未配置可用模型");
             return;
         };
-        // 记忆开启时,人设末尾附加记忆管理说明(开启后恒定,不影响缓存)
-        let prompt = if mem_cfg.enabled {
-            format!(
-                "{prompt}\n\n(你可以管理长期记忆:当你了解到值得长期记住的信息(用户偏好、重要事实、约定)时,在回复末尾用标记 [记忆:添加 内容] 写入;需要删除时用 [记忆:删除 内容片段]。不要写入临时性信息,每次只写最重要的。)"
-            )
-        } else {
-            prompt
-        };
-        let mut msgs = vec![ApiMessage {
-            role: "system".into(),
-            content: prompt,
-        }];
-        // 记忆消息:独立 system,位于人设之后(记忆变化不影响人设前缀缓存)
+        // 记忆管理说明作为恒定独立 system 消息(与人设分离):
+        // 开关切换不改变消息流前缀 → 缓存不受影响;关闭时仅不展示记忆内容、不执行标记
+        let mut msgs = vec![
+            ApiMessage {
+                role: "system".into(),
+                content: prompt,
+            },
+            ApiMessage {
+                role: "system".into(),
+                content: MEMORY_GUIDE.to_string(),
+            },
+        ];
+        // 记忆内容消息:独立 system,位于人设与说明之后(记忆变化不影响其前缀缓存)
         if mem_cfg.enabled {
             session.memory.refresh();
             if !session.memory.entries.is_empty() {
@@ -458,10 +462,10 @@ impl ChatCore {
                     ),
                 );
                 let mut out = reply.text;
-                // 模型记忆操作:解析并执行标记,剥离后再发送(仅记忆开启时)
+                // 记忆标记:总是剥离(防止关闭状态泄漏到群里);仅开启时执行
+                let (clean, ops) = memory::parse_memory_ops(&out);
+                out = clean;
                 if mem_cfg.enabled {
-                    let (clean, ops) = memory::parse_memory_ops(&out);
-                    out = clean;
                     for op in ops {
                         match op {
                             MemoryOp::Add(text) => {
@@ -744,7 +748,9 @@ impl ChatCore {
                 cfg.chat.memory.clone(),
             )
         };
-        let prompt_tok = estimate_tokens(&prompt, ratio) as u64;
+        // 固定前缀 token:人设 + 记忆说明(恒定) + 记忆内容(若开启) + 当前提问
+        let prompt_tok = (estimate_tokens(&prompt, ratio) + estimate_tokens(MEMORY_GUIDE, ratio))
+            as u64;
         let user_tok = estimate_tokens(user_text, ratio) as u64;
         // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
         let mut mem_tok: u64 = 0;
