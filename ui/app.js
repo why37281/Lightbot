@@ -154,6 +154,7 @@ async function loadConfig() {
   updateStatusView({ connected: false, mode: sv.mode, endpoint: sv.endpoint, self_id: null, last_error: "" });
   $("#btn-toggle").textContent = running ? "停止" : "启动";
   await refreshSessions();
+  await renderMemories();
 }
 
 function bindConfigToForm() {
@@ -172,6 +173,7 @@ function bindConfigToForm() {
   $("#cfg-seg-delay").value = n.segment_delay_ms;
   $("#cfg-enable-group").checked = c.enable_group;
   $("#cfg-enable-private").checked = c.enable_private;
+  $("#cfg-decider").checked = c.decider;
   $("#cfg-context").value = c.context_tokens;
   $("#cfg-reserve").value = c.reserve_tokens;
   $("#cfg-summarize").checked = c.summarize;
@@ -187,6 +189,10 @@ function bindConfigToForm() {
   $("#cfg-soft-at").checked = ij.soft_at_reply;
   $("#cfg-names").value = ij.names;
   $("#cfg-hooks").value = ij.hooks;
+  $("#cfg-memory").checked = c.memory.enabled;
+  $("#cfg-mem-max").value = c.memory.max_entries;
+  $("#cfg-mem-chars").value = c.memory.max_entry_chars;
+  $("#cfg-mem-tokens").value = c.memory.max_tokens;
   syncModeFields();
 }
 
@@ -206,6 +212,7 @@ function collectForm() {
   n.segment_delay_ms = parseInt($("#cfg-seg-delay").value) || 300;
   c.enable_group = $("#cfg-enable-group").checked;
   c.enable_private = $("#cfg-enable-private").checked;
+  c.decider = $("#cfg-decider").checked;
   c.context_tokens = parseInt($("#cfg-context").value) || 8192;
   c.reserve_tokens = parseInt($("#cfg-reserve").value) || 1024;
   c.summarize = $("#cfg-summarize").checked;
@@ -221,6 +228,10 @@ function collectForm() {
   ij.soft_at_reply = $("#cfg-soft-at").checked;
   ij.names = $("#cfg-names").value.trim();
   ij.hooks = $("#cfg-hooks").value.trim();
+  c.memory.enabled = $("#cfg-memory").checked;
+  c.memory.max_entries = parseInt($("#cfg-mem-max").value) || 30;
+  c.memory.max_entry_chars = parseInt($("#cfg-mem-chars").value) || 200;
+  c.memory.max_tokens = parseInt($("#cfg-mem-tokens").value) || 1200;
   cfg.active_model = $("#cfg-active-model").value;
   cfg.active_prompt = $("#cfg-active-prompt").value;
   return cfg;
@@ -482,6 +493,59 @@ async function refreshSessions() {
     tbody.appendChild(tr);
   }
 }
+
+// ---------- 记忆管理 ----------
+async function renderMemories() {
+  const box = $("#memory-list");
+  box.innerHTML = "";
+  let list = [];
+  try { list = await invoke("get_all_memories"); } catch (e) { box.textContent = "加载失败: " + e; return; }
+  if (!list.length) {
+    box.innerHTML = '<div class="tips">暂无记忆。对话中模型会自动写入,或通过 QQ 命令 /remember <内容> 添加。</div>';
+    return;
+  }
+  for (const s of list) {
+    const card = document.createElement("div");
+    card.className = "item-card";
+    const kind = s.key.startsWith("g") ? "群" : "私聊";
+    let rows = "";
+    for (const e of s.entries) {
+      rows += `<div class="kv">
+        <span>${e.index}. [${e.source === "model" ? "自动" : "用户"} ${e.date}] ${escapeHtml(e.text)}</span>
+        <button class="btn small danger del-mem" data-key="${escapeHtml(s.key)}" data-idx="${e.index}">删</button>
+      </div>`;
+    }
+    card.innerHTML = `
+      <div class="item-head"><b>${kind} ${escapeHtml(s.key.slice(1))}</b><span class="badge">${s.entries.length} 条</span></div>
+      <div style="display:flex;flex-direction:column;gap:6px">${rows}</div>
+      <div class="add-mem-row" style="display:flex;gap:8px;margin-top:10px">
+        <input type="text" class="mem-text" placeholder="添加记忆…" style="flex:1" />
+        <button class="btn small add-mem" data-key="${escapeHtml(s.key)}">添加</button>
+      </div>`;
+    box.appendChild(card);
+  }
+  box.querySelectorAll(".del-mem").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await invoke("delete_memory", { key: btn.dataset.key, index: parseInt(btn.dataset.idx) });
+        renderMemories();
+      } catch (e) { alert("删除失败: " + e); }
+    });
+  });
+  box.querySelectorAll(".add-mem").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const input = btn.closest(".add-mem-row").querySelector(".mem-text");
+      const text = input.value.trim();
+      if (!text) return;
+      try {
+        await invoke("add_memory", { key: btn.dataset.key, text });
+        renderMemories();
+      } catch (e) { alert("添加失败: " + e); }
+    });
+  });
+}
+
+$("#btn-refresh-mem").addEventListener("click", renderMemories);
 
 // ---------- 初始化 ----------
 loadConfig().catch((e) => {

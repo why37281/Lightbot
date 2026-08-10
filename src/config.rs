@@ -168,6 +168,11 @@ pub struct ChatConfig {
     pub clean_after_hours: u64,
     /// token 估算保守系数(防止低估导致超限)
     pub estimate_ratio: f64,
+    /// 回复决策器:任何触发命中后,先由当前模型判断是否需要回复(默认关闭;
+    /// 每次触发增加一次轻量模型调用)
+    pub decider: bool,
+    /// 长期记忆系统配置
+    pub memory: MemoryConfig,
     /// 主动插话(活人感)配置
     pub interject: InterjectConfig,
 }
@@ -183,7 +188,34 @@ impl Default for ChatConfig {
             summarize_tokens: 600,
             clean_after_hours: 24,
             estimate_ratio: 1.15,
+            decider: false,
+            memory: MemoryConfig::default(),
             interject: InterjectConfig::default(),
+        }
+    }
+}
+
+/// 长期记忆配置
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// 总开关:开启后模型可通过回复末尾标记自动写入记忆
+    pub enabled: bool,
+    /// 记忆条数上限(超出删最旧)
+    pub max_entries: u32,
+    /// 单条记忆最大字符数
+    pub max_entry_chars: u32,
+    /// 记忆总 token 上限(超出删最旧;保护上下文预算)
+    pub max_tokens: u32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 30,
+            max_entry_chars: 200,
+            max_tokens: 1200,
         }
     }
 }

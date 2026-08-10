@@ -158,7 +158,7 @@ impl LlmClient {
         ))
     }
 
-    /// 用当前模型把一批旧消息压缩成摘要(缓存友好折叠)
+    /// 用当前模型把一批旧消息压缩成摘要(缓存友好折叠,非思考模式)
     pub async fn summarize(
         &self,
         m: &ModelConfig,
@@ -190,8 +190,61 @@ impl LlmClient {
             .map_err(|e| format!("摘要生成失败: {e}"))?;
         Ok(reply.text)
     }
+
+    /// 决策请求:判断这条消息是否需要回复。
+    /// 用当前模型,但强制关闭思考模式、极小输出(16 tokens),开销接近一次 ping。
+    /// 上下文只带人设 + 当前消息,不带历史(决策只看当下值不值得回)。
+    pub async fn decide(&self, m: &ModelConfig, prompt: &str, text: &str) -> Result<bool, String> {
+        let mut m2 = m.clone();
+        m2.thinking = "disabled".into();
+        m2.max_tokens = 16;
+        let msgs = vec![
+            ApiMessage {
+                role: "system".into(),
+                content: format!(
+                    "{prompt}\n\n(你是这个群里的一员。判断下面这条消息是否需要你回复:\n\
+                     - 被点名、提问、求助、@你 → 需要回复\n\
+                     - 纯闲聊、与你无关、无需回应 → 不需要回复\n\
+                     只输出一个字母:需要回复输出 Y,不需要输出 N。)"
+                ),
+            },
+            ApiMessage {
+                role: "user".into(),
+                content: text.to_string(),
+            },
+        ];
+        let reply = self.chat(&m2, &msgs, Some(16)).await?;
+        Ok(parse_decision(&reply.text))
+    }
 }
 
+/// 解析决策输出:Y/y → 回复;N/n → 不回复;其他(乱输出)→ 保守回复
+pub fn parse_decision(text: &str) -> bool {
+    match text.trim().chars().next() {
+        Some('Y') | Some('y') => true,
+        Some('N') | Some('n') => false,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_parsing() {
+        assert!(parse_decision("Y"));
+        assert!(parse_decision("y"));
+        assert!(!parse_decision("N"));
+        assert!(!parse_decision("n"));
+        assert!(!parse_decision("N, 不需要"));
+        assert!(parse_decision(""));
+        assert!(parse_decision("我不知道"));
+        assert!(parse_decision("  Y  "));
+    }
+}
+
+/// 截断长文本(用于错误信息与日志)
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()

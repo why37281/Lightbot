@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::chat::{ChatCore, FrontendEvent};
 use crate::config::{self, Config, ModelConfig};
 use crate::llm::LlmClient;
+use crate::memory::MemoryStore;
 use crate::napcat::{BotEvent, ConnStatus, NapcatClient};
 
 // ---------- 应用状态 ----------
@@ -322,6 +323,71 @@ pub async fn clear_session(state: tauri::State<'_, AppState>, key: String) -> Re
             Ok(())
         }
         None => Err("机器人未运行".into()),
+    }
+}
+
+// ---------- 记忆命令 ----------
+
+#[tauri::command]
+pub async fn get_all_memories(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let dir = state.sessions_dir.join("memories");
+    let mut list = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let fname = e.file_name();
+            let fname = fname.to_string_lossy().to_string();
+            if let Some(key) = fname.strip_suffix(".jsonl") {
+                let mut store = MemoryStore::new(e.path());
+                store.refresh();
+                list.push(serde_json::json!({
+                    "key": key.to_string(),
+                    "entries": store.to_values(),
+                }));
+            }
+        }
+    }
+    list.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    Ok(list)
+}
+
+#[tauri::command]
+pub async fn add_memory(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    text: String,
+) -> Result<(), String> {
+    let cfg = state.config.read().await;
+    let mc = &cfg.chat.memory;
+    let path = state
+        .sessions_dir
+        .join("memories")
+        .join(format!("{key}.jsonl"));
+    let mut store = MemoryStore::new(path);
+    store.refresh();
+    let added = store.add(&text, "user", mc.max_entries as usize, mc.max_entry_chars as usize);
+    if added {
+        Ok(())
+    } else {
+        Err("记忆为空或已存在".into())
+    }
+}
+
+#[tauri::command]
+pub async fn delete_memory(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    index: usize,
+) -> Result<(), String> {
+    let path = state
+        .sessions_dir
+        .join("memories")
+        .join(format!("{key}.jsonl"));
+    let mut store = MemoryStore::new(path);
+    store.refresh();
+    if store.remove_index(index) {
+        Ok(())
+    } else {
+        Err("序号无效".into())
     }
 }
 

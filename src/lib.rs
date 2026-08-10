@@ -2,6 +2,7 @@ mod chat;
 mod commands;
 mod config;
 mod llm;
+mod memory;
 mod napcat;
 mod trigger;
 
@@ -23,6 +24,9 @@ pub fn run() {
             commands::get_sessions,
             commands::clear_session,
             commands::get_status_view,
+            commands::get_all_memories,
+            commands::add_memory,
+            commands::delete_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

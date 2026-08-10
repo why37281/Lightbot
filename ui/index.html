@@ -159,6 +159,9 @@
         <label class="check">启用私聊
           <input id="cfg-enable-private" type="checkbox" />
         </label>
+        <label class="check">回复决策器(触发后由模型判断是否回复,默认关)
+          <input id="cfg-decider" type="checkbox" />
+        </label>
         <label>单会话上下文预算(token,输入上限)
           <input id="cfg-context" type="number" min="512" max="128000" />
         </label>
@@ -180,6 +183,29 @@
       </div>
       <div class="tips">
         <p>💡 缓存友好机制:人设固定在最前 → 超预算只删最旧消息 → 前缀保持稳定,DeepSeek 自动命中缓存。摘要折叠后继续追加,前缀依旧稳定。</p>
+        <p>💡 回复决策器:任何触发(@/软 at/插话)命中后,先用当前模型快速判断这条消息是否值得回复,不需要则静默跳过。代价是每次触发多一次轻量调用(非思考、16 tokens 输出);决策失败时保守回复,不会漏回消息。</p>
+      </div>
+      <h3>长期记忆</h3>
+      <div class="form-grid narrow">
+        <label class="check">启用记忆系统(模型可自动写入)
+          <input id="cfg-memory" type="checkbox" />
+        </label>
+        <label>记忆条数上限
+          <input id="cfg-mem-max" type="number" min="1" max="200" />
+        </label>
+        <label>单条最大字符
+          <input id="cfg-mem-chars" type="number" min="10" max="1000" />
+        </label>
+        <label>记忆总 token 上限
+          <input id="cfg-mem-tokens" type="number" min="64" max="8000" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="btn-refresh-mem" class="btn small">刷新记忆列表</button>
+      </div>
+      <div id="memory-list"></div>
+      <div class="tips">
+        <p>💡 记忆按群/私聊独立,作为独立 system 消息放在人设之后——记忆变化不影响人设与历史的缓存命中。模型通过回复末尾 <code>[记忆:添加 xxx]</code> 标记自动写入;QQ 里可用 <code>/remember</code> <code>/forget</code> <code>/memories</code> 管理。</p>
       </div>
       <h3>主动插话(活人感)</h3>
       <div class="form-grid narrow">

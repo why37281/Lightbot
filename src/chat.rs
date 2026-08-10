@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::config::Config;
 use crate::llm::{ApiMessage, LlmClient};
+use crate::memory::{self, MemoryOp, MemoryStore};
 use crate::napcat::{ActionSender, ConnStatus, MsgKind, ParsedMsg};
 use crate::trigger;
 
@@ -96,6 +97,8 @@ pub struct Session {
     pub last_active: Instant,
     pub file: PathBuf,
     pub loaded: bool,
+    /// 长期记忆(独立文件 memories/{key}.jsonl,文件为唯一真相)
+    pub memory: MemoryStore,
 }
 
 impl Session {
@@ -108,6 +111,9 @@ impl Session {
             last_active: Instant::now(),
             file: dir.join(format!("{key}.jsonl")),
             loaded: false,
+            memory: MemoryStore::new(
+                dir.join("memories").join(format!("{key}.jsonl")),
+            ),
         }
     }
 
@@ -258,29 +264,65 @@ impl ChatCore {
         let win_min = cfg.chat.interject.activity_window_minutes.max(1);
         self.track_activity(&key, win_min * 60);
 
-        // ① 被动触发(@/回复/关键词/私聊)→ 完整通道
+        // ① 被动触发(@/回复/关键词/私聊)→ 完整通道(决策器通过才回复)
         if trigger::passive_hit(&cfg, &msg) {
             drop(cfg);
-            self.full_dialogue(&key, &msg).await;
+            if self.decider_ok(&msg.text).await {
+                self.full_dialogue(&key, &msg).await;
+            } else {
+                self.log("info", &format!("[{key}] 决策器:无需回复(被动触发)"));
+            }
             return;
         }
-        // ② 软 at(提到机器人称呼)→ 完整通道,必回,刷新插话冷却
+        // ② 软 at(提到机器人称呼)→ 完整通道,必回,刷新插话冷却(决策器通过才回复)
         if msg.kind == MsgKind::Group && trigger::soft_at_hit(&cfg, &msg.text) {
             drop(cfg);
-            self.mark_interjected(&key);
-            self.log("info", &format!("[{key}] 软 at 触发(称呼提及)"));
-            self.full_dialogue(&key, &msg).await;
+            if self.decider_ok(&msg.text).await {
+                self.mark_interjected(&key);
+                self.log("info", &format!("[{key}] 软 at 触发(称呼提及)"));
+                self.full_dialogue(&key, &msg).await;
+            } else {
+                self.log("info", &format!("[{key}] 决策器:无需回复(软 at)"));
+            }
             return;
         }
-        // ③ 插话采样 → 轻量通道(群聊,概率 + 冷却)
+        // ③ 插话采样 → 轻量通道(群聊,概率 + 冷却;决策器通过才插话)
         let user_text = trigger::strip_keyword(&msg.text, &cfg.napcat.keyword).to_string();
         if msg.kind == MsgKind::Group
             && !user_text.is_empty()
             && self.interject_sample(&key, &user_text).await
         {
             drop(cfg);
-            self.log("info", &format!("[{key}] 主动插话: {user_text}"));
-            self.light_reply(&msg, &user_text).await;
+            if self.decider_ok(&user_text).await {
+                self.log("info", &format!("[{key}] 主动插话: {user_text}"));
+                self.light_reply(&msg, &user_text).await;
+            } else {
+                // 决策拒绝也消耗本次插话机会,防止高频重试
+                self.mark_interjected(&key);
+                self.log("info", &format!("[{key}] 决策器:无需回复(插话)"));
+            }
+        }
+    }
+
+    /// 决策器:开启时由当前模型判断这条消息是否需要回复。
+    /// 关闭 / 无模型 / 决策调用失败 → 按需要回复处理(保守,不漏回消息)。
+    async fn decider_ok(&self, text: &str) -> bool {
+        let cfg = self.cfg.read().await;
+        if !cfg.chat.decider {
+            return true;
+        }
+        let model = cfg.active_model().cloned();
+        let prompt = cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default();
+        drop(cfg);
+        let Some(model) = model else {
+            return true;
+        };
+        match self.llm.decide(&model, &prompt, text).await {
+            Ok(yes) => yes,
+            Err(e) => {
+                self.log("warn", &format!("决策器调用失败,按需要回复处理: {e}"));
+                true
+            }
         }
     }
 
@@ -315,22 +357,41 @@ impl ChatCore {
         // 上下文预算管理(缓存友好截断/摘要)
         self.trim_context(&mut session, &user_text).await;
 
-        // 组装消息:system(人设) + system(摘要) + 历史 + 当前提问
-        let (prompt, model) = {
+        // 组装消息:system(人设) + system(记忆) + system(摘要) + 历史 + 当前提问
+        let (prompt, model, mem_cfg) = {
             let cfg = self.cfg.read().await;
             (
                 cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
                 cfg.active_model().cloned(),
+                cfg.chat.memory.clone(),
             )
         };
         let Some(model) = model else {
             self.log("error", "未配置可用模型");
             return;
         };
+        // 记忆开启时,人设末尾附加记忆管理说明(开启后恒定,不影响缓存)
+        let prompt = if mem_cfg.enabled {
+            format!(
+                "{prompt}\n\n(你可以管理长期记忆:当你了解到值得长期记住的信息(用户偏好、重要事实、约定)时,在回复末尾用标记 [记忆:添加 内容] 写入;需要删除时用 [记忆:删除 内容片段]。不要写入临时性信息,每次只写最重要的。)"
+            )
+        } else {
+            prompt
+        };
         let mut msgs = vec![ApiMessage {
             role: "system".into(),
             content: prompt,
         }];
+        // 记忆消息:独立 system,位于人设之后(记忆变化不影响人设前缀缓存)
+        if mem_cfg.enabled {
+            session.memory.refresh();
+            if !session.memory.entries.is_empty() {
+                msgs.push(ApiMessage {
+                    role: "system".into(),
+                    content: session.memory.system_text(),
+                });
+            }
+        }
         if let Some(s) = &session.summary {
             msgs.push(ApiMessage {
                 role: "system".into(),
@@ -397,6 +458,30 @@ impl ChatCore {
                     ),
                 );
                 let mut out = reply.text;
+                // 模型记忆操作:解析并执行标记,剥离后再发送(仅记忆开启时)
+                if mem_cfg.enabled {
+                    let (clean, ops) = memory::parse_memory_ops(&out);
+                    out = clean;
+                    for op in ops {
+                        match op {
+                            MemoryOp::Add(text) => {
+                                if session.memory.add(
+                                    &text,
+                                    "model",
+                                    mem_cfg.max_entries as usize,
+                                    mem_cfg.max_entry_chars as usize,
+                                ) {
+                                    self.log("info", &format!("[{key}] 模型写入记忆: {text}"));
+                                }
+                            }
+                            MemoryOp::Remove(needle) => {
+                                if session.memory.remove_contains(&needle) {
+                                    self.log("info", &format!("[{key}] 模型删除记忆: {needle}"));
+                                }
+                            }
+                        }
+                    }
+                }
                 if !reply.reasoning.is_empty() {
                     out = format!("💭 {}\n\n{}", reply.reasoning, out);
                 }
@@ -445,10 +530,12 @@ impl ChatCore {
         ];
         match self.llm.chat(&model, &msgs, Some(max_tokens)).await {
             Ok(reply) => {
-                let out = if reply.text.is_empty() {
+                // 插话场景剥离记忆标记但不执行(轻量通道不管理记忆)
+                let (text, _) = memory::parse_memory_ops(&reply.text);
+                let out = if text.is_empty() {
                     "(模型未返回内容)".to_string()
                 } else {
-                    reply.text
+                    text
                 };
                 let _ = self.send_text(msg, &out).await;
             }
@@ -542,7 +629,62 @@ impl ChatCore {
                 true
             }
             _ => {
-                if let Some(rest) = text.strip_prefix("/model ") {
+                if let Some(rest) = text.strip_prefix("/remember ") {
+                    let content = rest.trim();
+                    if content.is_empty() {
+                        let _ = self.send_text(msg, "用法:/remember <内容>").await;
+                    } else {
+                        session.memory.refresh();
+                        let ok = session.memory.add(
+                            content,
+                            "user",
+                            cfg.chat.memory.max_entries as usize,
+                            cfg.chat.memory.max_entry_chars as usize,
+                        );
+                        let _ = self
+                            .send_text(
+                                msg,
+                                if ok { "🧠 已记住。" } else { "这条记忆为空或已存在。" },
+                            )
+                            .await;
+                    }
+                    true
+                } else if let Some(rest) = text.strip_prefix("/forget ") {
+                    let content = rest.trim();
+                    if content.is_empty() {
+                        let _ = self.send_text(msg, "用法:/forget <内容或序号>").await;
+                    } else {
+                        session.memory.refresh();
+                        let ok = match content.parse::<usize>() {
+                            Ok(idx) => session.memory.remove_index(idx),
+                            Err(_) => session.memory.remove_contains(content),
+                        };
+                        let _ = self
+                            .send_text(
+                                msg,
+                                if ok { "🗑️ 已删除该记忆。" } else { "未找到匹配的记忆。" },
+                            )
+                            .await;
+                    }
+                    true
+                } else if text == "/memories" {
+                    session.memory.refresh();
+                    if session.memory.entries.is_empty() {
+                        let _ = self.send_text(msg, "🧠 暂无记忆。").await;
+                    } else {
+                        let mut s = String::from("🧠 长期记忆:\n");
+                        for (i, e) in session.memory.entries.iter().enumerate() {
+                            s.push_str(&format!(
+                                "{}. [{}] {}\n",
+                                i + 1,
+                                if e.source == "model" { "自动" } else { "用户" },
+                                e.text
+                            ));
+                        }
+                        let _ = self.send_text(msg, &s).await;
+                    }
+                    true
+                } else if let Some(rest) = text.strip_prefix("/model ") {
                     let name = rest.trim();
                     if cfg.models.iter().any(|m| m.name == name) {
                         {
@@ -591,7 +733,7 @@ impl ChatCore {
 
     /// 上下文预算管理:缓存友好截断 + 可选摘要折叠
     async fn trim_context(&self, session: &mut Session, user_text: &str) {
-        let (budget, summarize, summarize_tokens, ratio, prompt) = {
+        let (budget, summarize, summarize_tokens, ratio, prompt, mem_cfg) = {
             let cfg = self.cfg.read().await;
             (
                 cfg.chat.context_tokens.saturating_sub(cfg.chat.reserve_tokens) as u64,
@@ -599,15 +741,25 @@ impl ChatCore {
                 cfg.chat.summarize_tokens,
                 cfg.chat.estimate_ratio,
                 cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
+                cfg.chat.memory.clone(),
             )
         };
         let prompt_tok = estimate_tokens(&prompt, ratio) as u64;
         let user_tok = estimate_tokens(user_text, ratio) as u64;
+        // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
+        let mut mem_tok: u64 = 0;
+        if mem_cfg.enabled {
+            session.memory.refresh();
+            session
+                .memory
+                .trim_to_tokens(mem_cfg.max_tokens.max(64), ratio);
+            mem_tok = session.memory.total_tokens(ratio) as u64;
+        }
         let mut sum_tok = session.summary_tokens as u64;
         let hist_tok: u64 = session.history.iter().map(|h| h.tokens as u64).sum();
 
-        // 摘要与历史共享的预算(输入预算扣除人设与当前提问)
-        let input_budget = budget.saturating_sub(prompt_tok + user_tok);
+        // 摘要与历史共享的预算(输入预算扣除人设、记忆与当前提问)
+        let input_budget = budget.saturating_sub(prompt_tok + mem_tok + user_tok);
         if input_budget <= sum_tok && session.summary.is_some() {
             session.summary = None;
             sum_tok = 0;
