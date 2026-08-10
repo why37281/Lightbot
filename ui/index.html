@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LightBot - 轻量 QQ AI 机器人</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div class="brand">💡 LightBot</div>
+    <div class="top-status">
+      <span id="st-dot" class="dot gray"></span>
+      <span id="st-text">未启动</span>
+    </div>
+    <div class="top-actions">
+      <button id="btn-theme" class="btn" title="切换主题">☀️</button>
+      <button id="btn-save" class="btn primary">保存配置</button>
+      <button id="btn-toggle" class="btn accent">启动</button>
+    </div>
+  </header>
+
+  <aside id="sidebar">
+    <nav>
+      <a data-tab="overview" class="active">总览</a>
+      <a data-tab="napcat">连接设置</a>
+      <a data-tab="models">模型设置</a>
+      <a data-tab="chat">会话设置</a>
+      <a data-tab="prompts">人设管理</a>
+      <a data-tab="logs">日志与通知</a>
+    </nav>
+    <div class="side-foot">v0.1.0</div>
+  </aside>
+
+  <main id="content">
+
+    <!-- 总览 -->
+    <section id="tab-overview" class="tab active">
+      <h2>总览</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="card-title">机器人</div>
+          <div class="card-body">
+            <div class="kv"><span>运行状态</span><b id="ov-running">未启动</b></div>
+            <div class="kv"><span>NapCat 连接</span><b id="ov-conn">-</b></div>
+            <div class="kv"><span>连接模式</span><b id="ov-mode">-</b></div>
+            <div class="kv"><span>端点</span><b id="ov-endpoint">-</b></div>
+            <div class="kv"><span>机器人 QQ</span><b id="ov-self">-</b></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">当前模型</div>
+          <div class="card-body">
+            <div class="kv"><span>模型</span><b id="ov-model">-</b></div>
+            <div class="kv"><span>类型</span><b id="ov-kind">-</b></div>
+            <div class="kv"><span>人设</span><b id="ov-prompt">-</b></div>
+            <div class="kv"><span>上下文预算</span><b id="ov-budget">-</b></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">缓存优化(DeepSeek 自动缓存)</div>
+          <div class="card-body">
+            <div class="kv"><span>累计命中率</span><b id="ov-hit-ratio">-</b></div>
+            <div class="kv"><span>累计命中</span><b id="ov-hit">-</b></div>
+            <div class="kv"><span>累计未命中</span><b id="ov-miss">-</b></div>
+            <div class="kv"><span>最近一次耗时</span><b id="ov-last-ms">-</b></div>
+          </div>
+          <div class="card-note">命中缓存的部分计费约为正常的 1/10。保持人设与历史前缀稳定即可持续命中。</div>
+        </div>
+      </div>
+      <div class="tips">
+        <h3>常用命令(QQ 里发送)</h3>
+        <p><code>/clear</code> 清空当前会话上下文 · <code>/stats</code> 查看会话统计 · <code>/model &lt;名称&gt;</code> 切换模型 · <code>/prompt &lt;id&gt;</code> 切换人设</p>
+      </div>
+    </section>
+
+    <!-- 连接设置 -->
+    <section id="tab-napcat" class="tab">
+      <h2>连接设置</h2>
+      <div class="form-grid">
+        <label>连接模式
+          <select id="cfg-mode">
+            <option value="forward">正向 WS(本程序连接 NapCat)</option>
+            <option value="reverse">反向 WS(NapCat 连接本程序)</option>
+          </select>
+        </label>
+        <label id="lbl-ws-url">NapCat WS 地址
+          <input id="cfg-ws-url" type="text" placeholder="ws://127.0.0.1:3001" />
+        </label>
+        <label id="lbl-reverse-port">反向 WS 监听端口
+          <input id="cfg-reverse-port" type="number" min="1" max="65535" />
+        </label>
+        <label>Access Token(NapCat 中设置,留空则无)
+          <input id="cfg-token" type="text" placeholder="可选" />
+        </label>
+        <label>机器人 QQ 号(留空自动获取)
+          <input id="cfg-self" type="text" placeholder="自动" />
+        </label>
+        <label>群聊触发方式
+          <select id="cfg-trigger">
+            <option value="at_or_keyword">@机器人 / 回复机器人 / 关键词</option>
+            <option value="at">仅 @机器人 或回复</option>
+            <option value="keyword">仅关键词</option>
+          </select>
+        </label>
+        <label>关键词(触发方式含关键词时生效)
+          <input id="cfg-keyword" type="text" placeholder="如:小灯 " />
+        </label>
+        <label class="check">回应「回复机器人」的引用消息
+          <input id="cfg-reply-quoted" type="checkbox" />
+        </label>
+        <label class="check">思考时先发提示消息
+          <input id="cfg-reply-pending" type="checkbox" />
+        </label>
+        <label>提示消息文本
+          <input id="cfg-pending-text" type="text" />
+        </label>
+        <label>单条消息最大字符数(超出自动分段)
+          <input id="cfg-max-len" type="number" min="50" max="5000" />
+        </label>
+        <label>分段发送间隔(毫秒)
+          <input id="cfg-seg-delay" type="number" min="0" max="5000" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="btn-test-napcat" class="btn">测试连接</button>
+        <span id="test-napcat-result" class="result"></span>
+      </div>
+      <div class="tips">
+        <p>💡 NapCat 中:正向 WS 服务监听端口(默认 3001);反向 WS 需填 ws://127.0.0.1:<b>本程序端口</b>。access_token 两侧需一致。</p>
+      </div>
+    </section>
+
+    <!-- 模型设置 -->
+    <section id="tab-models" class="tab">
+      <h2>模型设置</h2>
+      <div class="form-grid narrow">
+        <label>当前使用模型
+          <select id="cfg-active-model"></select>
+        </label>
+      </div>
+      <div id="model-list"></div>
+      <div class="actions">
+        <button id="btn-add-model" class="btn">＋ 添加模型</button>
+      </div>
+      <div class="tips">
+        <p>💡 兼容一切 OpenAI 格式接口(DeepSeek / OpenAI / 通义 / Kimi / Ollama 等)。推理模型(deepseek-reasoner)回复会附带思考内容。</p>
+      </div>
+    </section>
+
+    <!-- 会话设置 -->
+    <section id="tab-chat" class="tab">
+      <h2>会话与上下文</h2>
+      <div class="form-grid narrow">
+        <label class="check">启用群聊
+          <input id="cfg-enable-group" type="checkbox" />
+        </label>
+        <label class="check">启用私聊
+          <input id="cfg-enable-private" type="checkbox" />
+        </label>
+        <label>单会话上下文预算(token,输入上限)
+          <input id="cfg-context" type="number" min="512" max="128000" />
+        </label>
+        <label>回复预留 token
+          <input id="cfg-reserve" type="number" min="64" max="8192" />
+        </label>
+        <label class="check">超预算时用 LLM 折叠旧消息为摘要(缓存友好)
+          <input id="cfg-summarize" type="checkbox" />
+        </label>
+        <label>摘要最大 token
+          <input id="cfg-summarize-tokens" type="number" min="64" max="4096" />
+        </label>
+        <label>空闲会话内存清理(小时,0=不清理)
+          <input id="cfg-clean-hours" type="number" min="0" max="720" />
+        </label>
+        <label>token 估算保守系数
+          <input id="cfg-est-ratio" type="number" step="0.05" min="1" max="3" />
+        </label>
+      </div>
+      <div class="tips">
+        <p>💡 缓存友好机制:人设固定在最前 → 超预算只删最旧消息 → 前缀保持稳定,DeepSeek 自动命中缓存。摘要折叠后继续追加,前缀依旧稳定。</p>
+      </div>
+      <h3>主动插话(活人感)</h3>
+      <div class="form-grid narrow">
+        <label class="check">启用主动插话
+          <input id="cfg-interject" type="checkbox" />
+        </label>
+        <label>插话模式
+          <select id="cfg-interject-mode">
+            <option value="adaptive">自适应(按群活跃度)</option>
+            <option value="fixed">固定概率</option>
+          </select>
+        </label>
+        <label>冷却时间(分钟)
+          <input id="cfg-interject-cooldown" type="number" min="1" max="1440" />
+        </label>
+        <label>基线概率(%)
+          <input id="cfg-interject-prob" type="number" min="0" max="60" step="1" />
+        </label>
+        <label>插话输出上限 tokens
+          <input id="cfg-interject-maxtok" type="number" min="16" max="1024" />
+        </label>
+        <label>活跃度窗口(分钟)
+          <input id="cfg-interject-window" type="number" min="1" max="60" />
+        </label>
+        <label class="check">提到称呼必回(软 at)
+          <input id="cfg-soft-at" type="checkbox" />
+        </label>
+        <label>机器人称呼(逗号分隔)
+          <input id="cfg-names" type="text" placeholder="小灯" />
+        </label>
+        <label>钩子词(逗号分隔)
+          <input id="cfg-hooks" type="text" />
+        </label>
+      </div>
+      <div class="tips">
+        <p>💡 插话走轻量通道:单轮、不占会话上下文、不落盘、不新开会话;概率 = 基线 + 钩子词加分 − 纯水减分,再按群活跃度缩放(刷屏 ×0.3,冷清 ×2)。软 at 走完整通道(记入历史),两者共用冷却。</p>
+      </div>
+      <h3>会话列表</h3>
+      <table id="session-table">
+        <thead><tr><th>会话</th><th>消息数</th><th>约 tokens</th><th>摘要</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 人设管理 -->
+    <section id="tab-prompts" class="tab">
+      <h2>人设管理</h2>
+      <div class="form-grid narrow">
+        <label>当前人设
+          <select id="cfg-active-prompt"></select>
+        </label>
+      </div>
+      <div id="prompt-list"></div>
+      <div class="actions">
+        <button id="btn-add-prompt" class="btn">＋ 添加人设</button>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section id="tab-logs" class="tab">
+      <h2>日志与通知</h2>
+      <div class="log-toolbar">
+        <select id="log-level">
+          <option value="all">全部</option>
+          <option value="info">信息+</option>
+          <option value="warn">警告+</option>
+          <option value="error">错误</option>
+        </select>
+        <button id="btn-clear-log" class="btn small">清空</button>
+        <span id="log-count"></span>
+      </div>
+      <div id="log-box"></div>
+    </section>
+
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

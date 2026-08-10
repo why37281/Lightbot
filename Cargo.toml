@@ -1,0 +1,26 @@
+[package]
+name = "lightbot"
+version = "0.1.0"
+edition = "2021"
+description = "LightBot - 轻量级 NapCat QQ 机器人框架,接入 AI 大模型"
+authors = ["LightBot"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal"] }
+tokio-tungstenite = { version = "0.26", features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["rt"] }
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

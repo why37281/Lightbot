@@ -1,0 +1,7 @@
+/target
+# tauri 构建自动生成的 schema
+/gen/
+# 外部参考文档(用户提供的 NapCat OpenAPI 资料,不入版本库)
+/OpenAPI.md
+# AI 会话元数据
+/.reasonix/
