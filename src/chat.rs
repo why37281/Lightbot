@@ -361,7 +361,10 @@ impl ChatCore {
         // 上下文预算管理(缓存友好截断/摘要)
         self.trim_context(&mut session, &user_text).await;
 
-        // 组装消息:system(人设) + system(记忆) + system(摘要) + 历史 + 当前提问
+        // 组装消息(缓存友好顺序):
+        // [人设][记忆说明] [摘要] [历史] [记忆内容] [提问]
+        // 记忆放在历史之后、提问之前:新记忆追加时公共前缀 = 人设+说明+摘要+历史(大头),
+        // 缓存几乎全部命中;若记忆在摘要前,新增记忆会让中间消息变长,摘要+历史缓存全断。
         let (prompt, model, mem_cfg) = {
             let cfg = self.cfg.read().await;
             (
@@ -386,16 +389,6 @@ impl ChatCore {
                 content: MEMORY_GUIDE.to_string(),
             },
         ];
-        // 记忆内容消息:独立 system,位于人设与说明之后(记忆变化不影响其前缀缓存)
-        if mem_cfg.enabled {
-            session.memory.refresh();
-            if !session.memory.entries.is_empty() {
-                msgs.push(ApiMessage {
-                    role: "system".into(),
-                    content: session.memory.system_text(),
-                });
-            }
-        }
         if let Some(s) = &session.summary {
             msgs.push(ApiMessage {
                 role: "system".into(),
@@ -407,6 +400,16 @@ impl ChatCore {
                 role: h.role.clone(),
                 content: h.text.clone(),
             });
+        }
+        // 记忆内容消息:位于历史之后、提问之前(追加/删除几乎不影响摘要+历史缓存)
+        if mem_cfg.enabled {
+            session.memory.refresh();
+            if !session.memory.entries.is_empty() {
+                msgs.push(ApiMessage {
+                    role: "system".into(),
+                    content: session.memory.system_text(),
+                });
+            }
         }
         msgs.push(ApiMessage {
             role: "user".into(),
