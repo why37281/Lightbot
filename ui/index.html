@@ -110,8 +110,11 @@
         <label class="check">回应「回复机器人」的引用消息
           <input id="cfg-reply-quoted" type="checkbox" />
         </label>
-        <label class="check">思考时先发提示消息
+        <label class="check">思考超时发提示消息
           <input id="cfg-reply-pending" type="checkbox" />
+        </label>
+        <label>思考提示延迟(秒,超过才提示)
+          <input id="cfg-pending-delay" type="number" min="1" max="300" />
         </label>
         <label>提示消息文本
           <input id="cfg-pending-text" type="text" />

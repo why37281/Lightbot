@@ -95,20 +95,19 @@ impl MemoryStore {
         true
     }
 
-    /// 按内容包含匹配删除(返回是否删除)
-    pub fn remove_contains(&mut self, needle: &str) -> bool {
+    /// 按内容包含匹配删除,返回删除条数
+    pub fn remove_contains(&mut self, needle: &str) -> usize {
         let needle = needle.trim();
         if needle.is_empty() {
-            return false;
+            return 0;
         }
         let before = self.entries.len();
         self.entries.retain(|e| !e.text.contains(needle));
-        if self.entries.len() != before {
+        let removed = before - self.entries.len();
+        if removed > 0 {
             self.save();
-            true
-        } else {
-            false
         }
+        removed
     }
 
     /// 按序号删除(1-based),返回是否删除
@@ -272,9 +271,9 @@ mod tests {
         m.add("A", "user", 30, 200);
         m.add("B", "user", 30, 200);
         m.add("C", "user", 30, 200);
-        assert!(m.remove_contains("B"));
+        assert_eq!(m.remove_contains("B"), 1);
         assert_eq!(m.entries.len(), 2);
-        assert!(!m.remove_contains("不存在"));
+        assert_eq!(m.remove_contains("不存在"), 0);
         assert!(m.remove_index(2)); // 删 C(现在索引 2 是 C)
         assert_eq!(m.entries.len(), 1);
         assert!(!m.remove_index(5));

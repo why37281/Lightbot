@@ -151,7 +151,7 @@ async function loadConfig() {
   renderOverview();
   const sv = await invoke("get_status_view");
   running = sv.running;
-  updateStatusView({ connected: false, mode: sv.mode, endpoint: sv.endpoint, self_id: null, last_error: "" });
+  updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error });
   $("#btn-toggle").textContent = running ? "停止" : "启动";
   await refreshSessions();
   await renderMemories();
@@ -168,6 +168,7 @@ function bindConfigToForm() {
   $("#cfg-keyword").value = n.keyword;
   $("#cfg-reply-quoted").checked = n.reply_quoted;
   $("#cfg-reply-pending").checked = n.reply_pending;
+  $("#cfg-pending-delay").value = n.pending_delay_secs;
   $("#cfg-pending-text").value = n.pending_text;
   $("#cfg-max-len").value = n.max_msg_len;
   $("#cfg-seg-delay").value = n.segment_delay_ms;
@@ -207,6 +208,7 @@ function collectForm() {
   n.keyword = $("#cfg-keyword").value;
   n.reply_quoted = $("#cfg-reply-quoted").checked;
   n.reply_pending = $("#cfg-reply-pending").checked;
+  n.pending_delay_secs = parseInt($("#cfg-pending-delay").value) || 15;
   n.pending_text = $("#cfg-pending-text").value;
   n.max_msg_len = parseInt($("#cfg-max-len").value) || 1800;
   n.segment_delay_ms = parseInt($("#cfg-seg-delay").value) || 300;
@@ -283,8 +285,20 @@ $("#btn-toggle").addEventListener("click", async () => {
     }
     running = !running;
     btn.textContent = running ? "停止" : "启动";
-    $("#st-dot").className = "dot " + (running ? "yellow" : "gray");
-    $("#st-text").textContent = running ? "启动中…" : "未启动";
+    if (running) {
+      // 启动后的过渡状态;稍后主动拉一次真实状态(不依赖事件链路)
+      $("#st-dot").className = "dot yellow";
+      $("#st-text").textContent = "启动中…";
+      setTimeout(async () => {
+        try {
+          const sv = await invoke("get_status_view");
+          if (running) updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error });
+        } catch (e) { /* 忽略 */ }
+      }, 800);
+    } else {
+      $("#st-dot").className = "dot gray";
+      $("#st-text").textContent = "未启动";
+    }
     $("#ov-running").textContent = running ? "运行中" : "未启动";
   } catch (e) {
     addLog("error", "操作失败: " + e);

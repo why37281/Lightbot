@@ -30,6 +30,8 @@ pub struct AppState {
     pub chat: Mutex<Option<Arc<ChatCore>>>,
     /// 启动/重启互斥(防并发 start_bot 与 save_config 重启竞态)
     pub restart_lock: tokio::sync::Mutex<()>,
+    /// 最近一次连接状态快照(get_status_view 兜底用,不依赖事件链路)
+    pub last_status: Arc<Mutex<Option<ConnStatus>>>,
 }
 
 pub struct BotHandle {
@@ -73,6 +75,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         bot: Mutex::new(None),
         chat: Mutex::new(None),
         restart_lock: tokio::sync::Mutex::new(()),
+        last_status: Arc::new(Mutex::new(None)),
     });
     Ok(())
 }
@@ -221,12 +224,26 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
         }
     }));
 
-    // 连接状态 -> 前端
+    // 连接状态 -> 前端(同时写快照供 get_status_view 兜底)
     let ev_tx3 = state.ev_tx.clone();
+    let last_status = state.last_status.clone();
     tasks.push(tauri::async_runtime::spawn(async move {
         while status_rx.changed().await.is_ok() {
             let s = status_rx.borrow().clone();
-            let _ = ev_tx3.try_send(FrontendEvent::Status { status: s });
+            *last_status.lock().unwrap() = Some(s.clone());
+            let _ = ev_tx3.try_send(FrontendEvent::Status { status: s.clone() });
+            let _ = ev_tx3.try_send(FrontendEvent::Log {
+                level: "info".into(),
+                msg: format!(
+                    "连接状态: {}{}",
+                    if s.connected { "已连接" } else { "未连接" },
+                    if s.last_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", s.last_error)
+                    }
+                ),
+            });
         }
     }));
 
@@ -396,9 +413,11 @@ pub async fn delete_memory(
 #[derive(Serialize, Clone)]
 pub struct StatusView {
     pub running: bool,
+    pub connected: bool,
     pub mode: String,
     pub endpoint: String,
     pub self_id: Option<String>,
+    pub last_error: String,
 }
 
 #[tauri::command]
@@ -415,10 +434,20 @@ pub async fn get_status_view(state: tauri::State<'_, AppState>) -> Result<Status
         let sid = n.self_id.trim().to_string();
         (n.mode.clone(), endpoint, if sid.is_empty() { None } else { Some(sid) })
     };
+    // 最近连接状态快照(事件链路外的前端兜底)
+    let (connected, live_self, last_error) = {
+        let g = state.last_status.lock().map_err(|e| e.to_string())?;
+        match g.as_ref() {
+            Some(s) => (s.connected, s.self_id, s.last_error.clone()),
+            None => (false, None, String::new()),
+        }
+    };
     Ok(StatusView {
         running,
+        connected,
         mode,
         endpoint,
-        self_id,
+        self_id: self_id.or(live_self.map(|i| i.to_string())),
+        last_error,
     })
 }

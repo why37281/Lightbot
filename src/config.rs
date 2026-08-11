@@ -61,8 +61,11 @@ pub struct NapcatConfig {
     pub keyword: String,
     /// 是否响应「回复机器人消息」的引用
     pub reply_quoted: bool,
-    /// 思考/等待时是否先发一条提示消息
+    /// 思考/等待时是否发提示消息(延迟到思考超过阈值才发)
     pub reply_pending: bool,
+    /// 思考提示延迟(秒):思考超过该时长仍未完成才提示;
+    /// 首 token 到达前的等待(约 3-5s)不计入,实现按 4s 估计扣除
+    pub pending_delay_secs: u64,
     /// 提示消息文本
     pub pending_text: String,
     /// 单条消息最大字符数,超出自动分段
@@ -83,6 +86,7 @@ impl Default for NapcatConfig {
             keyword: String::new(),
             reply_quoted: true,
             reply_pending: true,
+            pending_delay_secs: 15,
             pending_text: "正在思考,请稍候…".into(),
             max_msg_len: 1800,
             segment_delay_ms: 300,
