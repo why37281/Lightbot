@@ -29,9 +29,9 @@
 
 1. 安装 [NapCat](https://napcat.napneko.icu/)(Windows 直接解压运行,登录 QQ 后即为运行态);
 2. 打开 NapCat 的 WebUI(`http://127.0.0.1:6099`),进入「网络配置」:
-   - **正向 WS(推荐)**:新建一个 `WebSocket 客户端`,监听端口保持默认 `3001`;
-   - **反向 WS**:新建 `WebSocket 服务端`,地址填 `ws://127.0.0.1:3005`(LightBot 默认反向端口);
-   - 如需鉴权,两侧填写相同的 `access_token`。
+   - **正向 WS(推荐)**:新建一个 `WebSocket 服务器`,端口保持默认 `3001`(NapCat 作为服务端监听,LightBot 作为客户端主动连接它);
+   - **反向 WS**:新建 `WebSocket 客户端`,地址填 `ws://127.0.0.1:3005`(NapCat 作为客户端主动连 LightBot 的监听端口);
+   - 如需鉴权,两侧填写相同的 `access_token`(LightBot 通过 URL 参数传递,与 NapCat 兼容)。
 3. 保持 NapCat 运行。
 
 ### 2. 运行 LightBot

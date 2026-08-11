@@ -20,8 +20,8 @@ pub fn passive_hit(cfg: &Config, msg: &ParsedMsg) -> bool {
             if !cfg.chat.enable_group {
                 return false;
             }
-            let kw = cfg.napcat.keyword.trim();
-            let kw_hit = !kw.is_empty() && msg.text.contains(kw);
+            // 关键词:逗号分隔列表,任一命中(包含即触发)
+            let kw_hit = contains_any(&msg.text, &cfg.napcat.keyword);
             match cfg.napcat.group_trigger.as_str() {
                 "at" => msg.at_me || (cfg.napcat.reply_quoted && msg.reply_me),
                 "keyword" => kw_hit,
@@ -125,15 +125,15 @@ pub fn activity_factor(rate_per_min: f64) -> f64 {
     }
 }
 
-/// 剥离关键词前缀(触发用;不匹配则原文返回)。前缀后残留的空格一并去掉。
+/// 剥离关键词前缀(触发用;不匹配则原文返回)。支持逗号分隔多关键词,
+/// 任一关键词命中前缀即剥离(前缀后残留的空格一并去掉)。
 pub fn strip_keyword<'a>(text: &'a str, kw: &str) -> &'a str {
-    let kw = kw.trim();
-    if kw.is_empty() {
-        return text;
+    for k in kw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(rest) = text.strip_prefix(k) {
+            return rest.trim_start();
+        }
     }
-    text.strip_prefix(kw)
-        .map(|rest| rest.trim_start())
-        .unwrap_or(text)
+    text
 }
 
 /// 逗号分隔列表是否命中文本(任一项非空且被包含)
@@ -254,5 +254,24 @@ mod tests {
         let kw = "小灯 ";
         assert_eq!(strip_keyword("小灯 你好", kw), "你好");
         assert_eq!(strip_keyword("你好", kw), "你好");
+        // 多关键词
+        assert_eq!(strip_keyword("机器人 你好", "小灯,机器人"), "你好");
+        assert_eq!(strip_keyword("小灯你好", "小灯, 机器人"), "你好");
+        assert_eq!(strip_keyword("灯你好", "小灯,机器人"), "灯你好");
+    }
+
+    #[test]
+    fn keyword_list_multi() {
+        let mut cfg = Config::default();
+        cfg.napcat.group_trigger = "keyword".into();
+        cfg.napcat.keyword = "小灯,机器人".into();
+        // 任一关键词包含即触发
+        assert!(passive_hit(&cfg, &msg_group("机器人今天吃什么")));
+        assert!(passive_hit(&cfg, &msg_group("小灯在吗")));
+        // 不匹配不触发
+        assert!(!passive_hit(&cfg, &msg_group("今天吃什么")));
+        // 空关键词永不触发
+        cfg.napcat.keyword = "  , ".into();
+        assert!(!passive_hit(&cfg, &msg_group("小灯在吗")));
     }
 }
