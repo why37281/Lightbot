@@ -611,7 +611,7 @@ impl ChatCore {
         if !ij.enabled || ij.mode == "off" {
             return false;
         }
-        let cooldown = Duration::from_secs(ij.cooldown_minutes.max(1) * 60);
+        let cooldown = Duration::from_secs(ij.cooldown_secs.max(1));
         let now = Instant::now();
         if let Some(last) = self.interject_at.lock().unwrap().get(key) {
             if now.duration_since(*last) < cooldown {
@@ -682,24 +682,41 @@ impl ChatCore {
                     true
                 } else if let Some(rest) = text.strip_prefix("/forget ") {
                     let content = rest.trim();
-                    if content.is_empty() {
-                        let _ = self.send_text(msg, "用法:/forget <内容或序号>").await;
-                    } else {
-                        session.memory.refresh();
-                        let removed = match content.parse::<usize>() {
-                            Ok(idx) => {
-                                if session.memory.remove_index(idx) {
-                                    1
-                                } else {
-                                    0
-                                }
+                    session.memory.refresh();
+                    // 仅支持英文逗号分隔的数字序号,如 /forget 1,3
+                    let mut idxs: Vec<usize> = Vec::new();
+                    let mut valid = true;
+                    for part in content.split(',') {
+                        let p = part.trim();
+                        if p.is_empty() {
+                            continue;
+                        }
+                        match p.parse::<usize>() {
+                            Ok(i) => idxs.push(i),
+                            Err(_) => {
+                                valid = false;
+                                break;
                             }
-                            Err(_) => session.memory.remove_contains(content),
-                        };
+                        }
+                    }
+                    if !valid || idxs.is_empty() {
+                        let _ = self
+                            .send_text(msg, "用法:/forget <序号,逗号分隔,如 1,3>")
+                            .await;
+                    } else {
+                        idxs.sort_unstable();
+                        idxs.dedup();
+                        // 从大到小删除,避免序号漂移
+                        let mut removed = 0;
+                        for idx in idxs.into_iter().rev() {
+                            if session.memory.remove_index(idx) {
+                                removed += 1;
+                            }
+                        }
                         let reply_text = if removed > 0 {
                             format!("🗑️ 已删除 {removed} 条记忆。")
                         } else {
-                            "未找到匹配的记忆。".to_string()
+                            "未找到匹配的序号。".to_string()
                         };
                         let _ = self.send_text(msg, &reply_text).await;
                     }
@@ -709,15 +726,25 @@ impl ChatCore {
                     if session.memory.entries.is_empty() {
                         let _ = self.send_text(msg, "🧠 暂无记忆。").await;
                     } else {
-                        let mut s = String::from("🧠 长期记忆:\n");
+                        let scope = if msg.kind == MsgKind::Group {
+                            "本群"
+                        } else {
+                            "本会话"
+                        };
+                        let mut s = format!(
+                            "🧠 {scope}长期记忆({} 条):\n",
+                            session.memory.entries.len()
+                        );
                         for (i, e) in session.memory.entries.iter().enumerate() {
                             s.push_str(&format!(
-                                "{}. [{}] {}\n",
+                                "{}. [{} {}] {}\n",
                                 i + 1,
                                 if e.source == "model" { "自动" } else { "用户" },
+                                crate::memory::fmt_ts(e.ts),
                                 e.text
                             ));
                         }
+                        s.push_str("\n💡 添加:/remember <内容> · 删除:/forget <序号,如 1,3>");
                         let _ = self.send_text(msg, &s).await;
                     }
                     true

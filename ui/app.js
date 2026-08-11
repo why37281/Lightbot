@@ -183,7 +183,7 @@ function bindConfigToForm() {
   $("#cfg-est-ratio").value = c.estimate_ratio;
   $("#cfg-interject").checked = ij.enabled;
   $("#cfg-interject-mode").value = ij.mode;
-  $("#cfg-interject-cooldown").value = ij.cooldown_minutes;
+  $("#cfg-interject-cooldown").value = ij.cooldown_secs;
   $("#cfg-interject-prob").value = Math.round(ij.base_probability * 100);
   $("#cfg-interject-maxtok").value = ij.interject_max_tokens;
   $("#cfg-interject-window").value = ij.activity_window_minutes;
@@ -223,7 +223,7 @@ function collectForm() {
   c.estimate_ratio = parseFloat($("#cfg-est-ratio").value) || 1.15;
   ij.enabled = $("#cfg-interject").checked;
   ij.mode = $("#cfg-interject-mode").value;
-  ij.cooldown_minutes = parseInt($("#cfg-interject-cooldown").value) || 15;
+  ij.cooldown_secs = parseInt($("#cfg-interject-cooldown").value) || 90;
   ij.base_probability = (parseFloat($("#cfg-interject-prob").value) || 5) / 100;
   ij.interject_max_tokens = parseInt($("#cfg-interject-maxtok").value) || 120;
   ij.activity_window_minutes = parseInt($("#cfg-interject-window").value) || 2;

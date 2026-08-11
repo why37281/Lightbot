@@ -233,8 +233,8 @@ pub struct InterjectConfig {
     pub enabled: bool,
     /// 模式: "adaptive" 按群活跃度自适应 / "fixed" 固定概率
     pub mode: String,
-    /// 两次主动发言的最小间隔(分钟),软 at 也会刷新它
-    pub cooldown_minutes: u64,
+    /// 两次主动发言的最小间隔(秒),软 at 也会刷新它
+    pub cooldown_secs: u64,
     /// 基线概率(0.0~1.0),命中钩子词加分、纯水消息减分
     pub base_probability: f64,
     /// 插话输出上限 tokens(轻量通道,保持低成本)
@@ -254,7 +254,7 @@ impl Default for InterjectConfig {
         Self {
             enabled: true,
             mode: "adaptive".into(),
-            cooldown_minutes: 15,
+            cooldown_secs: 90,
             base_probability: 0.05,
             interject_max_tokens: 120,
             activity_window_minutes: 2,

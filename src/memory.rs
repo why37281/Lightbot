@@ -174,7 +174,7 @@ impl MemoryStore {
 }
 
 /// 时间显示 MM-DD
-fn fmt_ts(ts: i64) -> String {
+pub fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.format("%m-%d").to_string())
         .unwrap_or_default()
