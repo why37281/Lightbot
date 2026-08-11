@@ -44,6 +44,11 @@ $$("#sidebar nav a").forEach((a) => {
     a.classList.add("active");
     $$(".tab").forEach((t) => t.classList.remove("active"));
     $("#tab-" + a.dataset.tab).classList.add("active");
+    // 进入会话设置时主动刷新(不依赖事件链路,事件丢失也能看到最新)
+    if (a.dataset.tab === "chat") {
+      refreshSessions();
+      renderMemories();
+    }
   });
 });
 
@@ -300,6 +305,9 @@ $("#btn-toggle").addEventListener("click", async () => {
       $("#st-text").textContent = "未启动";
     }
     $("#ov-running").textContent = running ? "运行中" : "未启动";
+    // 启动/停止后刷新会话列表(不依赖事件链路)
+    refreshSessions();
+    renderMemories();
   } catch (e) {
     addLog("error", "操作失败: " + e);
     alert("操作失败: " + e);
@@ -559,6 +567,7 @@ async function renderMemories() {
   });
 }
 
+$("#btn-refresh-sessions").addEventListener("click", refreshSessions);
 $("#btn-refresh-mem").addEventListener("click", renderMemories);
 
 // ---------- 初始化 ----------

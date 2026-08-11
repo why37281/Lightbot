@@ -306,6 +306,12 @@ impl ChatCore {
                 self.mark_interjected(&key);
                 self.log("info", &format!("[{key}] 决策器:无需回复(插话)"));
             }
+        } else {
+            // 全部触发条件未命中
+            self.log(
+                "debug",
+                &format!("[{key}] 未触发回复逻辑: {}", msg.text),
+            );
         }
     }
 
@@ -323,7 +329,13 @@ impl ChatCore {
             return true;
         };
         match self.llm.decide(&model, &prompt, text).await {
-            Ok(yes) => yes,
+            Ok(yes) => {
+                self.log(
+                    "info",
+                    &format!("决策器: {}这条消息", if yes { "需要回复" } else { "无需回复" }),
+                );
+                yes
+            }
             Err(e) => {
                 self.log("warn", &format!("决策器调用失败,按需要回复处理: {e}"));
                 true
@@ -341,6 +353,10 @@ impl ChatCore {
         };
         session.ensure_loaded();
         session.last_active = Instant::now();
+        self.log(
+            "debug",
+            &format!("[{key}] 会话加载: 历史 {} 条", session.history.len()),
+        );
 
         // 命令处理
         let text = msg.text.trim();
@@ -405,6 +421,10 @@ impl ChatCore {
         // 记忆内容消息:位于历史之后、提问之前(追加/删除几乎不影响摘要+历史缓存)
         if mem_cfg.enabled {
             session.memory.refresh();
+            self.log(
+                "debug",
+                &format!("[{key}] 记忆: {} 条", session.memory.entries.len()),
+            );
             if !session.memory.entries.is_empty() {
                 msgs.push(ApiMessage {
                     role: "system".into(),
@@ -615,12 +635,30 @@ impl ChatCore {
         let now = Instant::now();
         if let Some(last) = self.interject_at.lock().unwrap().get(key) {
             if now.duration_since(*last) < cooldown {
+                self.log(
+                    "debug",
+                    &format!(
+                        "[{key}] 插话采样: 冷却中,剩余 {}s",
+                        cooldown.as_secs() - now.duration_since(*last).as_secs()
+                    ),
+                );
                 return false;
             }
         }
         let factor = trigger::activity_factor(self.activity_rate(key, ij.activity_window_minutes.max(1)));
         let p = trigger::interject_probability(&cfg, text, factor);
-        if !trigger::sample(pseudo_random(), p) {
+        let rand = pseudo_random();
+        let hit = trigger::sample(rand, p);
+        self.log(
+            "debug",
+            &format!(
+                "[{key}] 插话采样: 概率 {:.1}%(活跃因子 ×{factor}),随机 {:.4} → {}",
+                p * 100.0,
+                rand,
+                if hit { "🎲 命中" } else { "未命中" }
+            ),
+        );
+        if !hit {
             return false;
         }
         self.mark_interjected(key);
@@ -642,6 +680,15 @@ impl ChatCore {
             }
             "/stats" => {
                 let toks = session.total_tokens();
+                self.log(
+                    "info",
+                    &format!(
+                        "[{}] 查看统计: {} 条消息,约 {} tokens",
+                        session.key,
+                        session.history.len(),
+                        toks
+                    ),
+                );
                 let _ = self
                     .send_text(
                         msg,
@@ -677,6 +724,14 @@ impl ChatCore {
                         } else {
                             "这条记忆为空或已存在。".to_string()
                         };
+                        self.log(
+                            "info",
+                            &format!(
+                                "[{}] 用户添加记忆{}: {content}",
+                                session.key,
+                                if ok { "" } else { "(重复或为空)" }
+                            ),
+                        );
                         let _ = self.send_text(msg, &reply_text).await;
                     }
                     true
@@ -718,6 +773,14 @@ impl ChatCore {
                         } else {
                             "未找到匹配的序号。".to_string()
                         };
+                        self.log(
+                            "info",
+                            &format!(
+                                "[{}] 用户删除记忆: 序号 [{}],删除 {removed} 条",
+                                session.key,
+                                content
+                            ),
+                        );
                         let _ = self.send_text(msg, &reply_text).await;
                     }
                     true
@@ -745,6 +808,10 @@ impl ChatCore {
                             ));
                         }
                         s.push_str("\n💡 添加:/remember <内容> · 删除:/forget <序号,如 1,3>");
+                        self.log(
+                            "info",
+                            &format!("[{}] 查看记忆: {} 条", session.key, session.memory.entries.len()),
+                        );
                         let _ = self.send_text(msg, &s).await;
                     }
                     true
@@ -824,10 +891,12 @@ impl ChatCore {
                 cfg.chat.memory.clone(),
             )
         };
-        // 固定前缀 token:人设 + 记忆说明(恒定) + 记忆内容(若开启) + 当前提问
-        let prompt_tok = (estimate_tokens(&prompt, ratio) + estimate_tokens(MEMORY_GUIDE, ratio))
-            as u64;
-        let user_tok = estimate_tokens(user_text, ratio) as u64;
+        let (prompt_tok, user_tok) = {
+            // 固定前缀 token:人设 + 记忆说明(恒定) + 当前提问
+            let pt = (estimate_tokens(&prompt, ratio) + estimate_tokens(MEMORY_GUIDE, ratio))
+                as u64;
+            (pt, estimate_tokens(user_text, ratio) as u64)
+        };
         // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
         let mut mem_tok: u64 = 0;
         if mem_cfg.enabled {
@@ -839,6 +908,16 @@ impl ChatCore {
         }
         let mut sum_tok = session.summary_tokens as u64;
         let hist_tok: u64 = session.history.iter().map(|h| h.tokens as u64).sum();
+
+        // 预算报告(debug):裁剪前的占用明细
+        self.log(
+            "debug",
+            &format!(
+                "[{}] 上下文预算: 人设{prompt_tok} + 记忆{mem_tok} + 摘要{sum_tok} + 历史{hist_tok}({}条) / 总预算 {budget}t",
+                session.key,
+                session.history.len()
+            ),
+        );
 
         // 摘要与历史共享的预算(输入预算扣除人设、记忆与当前提问)
         let input_budget = budget.saturating_sub(prompt_tok + mem_tok + user_tok);
@@ -953,16 +1032,35 @@ impl ChatCore {
             .chunks(max_len)
             .map(|c| c.iter().collect())
             .collect();
+        if chunks.len() > 1 {
+            self.log(
+                "info",
+                &format!("[{}] 回复较长,分 {} 段发送", session_key(msg), chunks.len()),
+            );
+        }
         for (i, chunk) in chunks.iter().enumerate() {
-            match msg.kind {
+            let r = match msg.kind {
                 MsgKind::Group => {
                     self.sender
                         .send_group_msg(msg.group_id.unwrap_or(0), chunk)
-                        .await?;
+                        .await
                 }
                 MsgKind::Private => {
-                    self.sender.send_private_msg(msg.user_id, chunk).await?;
+                    self.sender.send_private_msg(msg.user_id, chunk).await
                 }
+            };
+            if let Err(e) = r {
+                self.log(
+                    "warn",
+                    &format!(
+                        "[{}] 发送失败(第 {}/{} 段,共 {} 字): {e}",
+                        session_key(msg),
+                        i + 1,
+                        chunks.len(),
+                        text.chars().count()
+                    ),
+                );
+                return Err(e);
             }
             self.emit_msg_out(&session_key(msg), chunk);
             if i + 1 < chunks.len() {
@@ -1038,71 +1136,28 @@ impl ChatCore {
     /// 供 GUI 使用的会话列表:以磁盘扫描为底(处理中/未加载的会话也能看到),
     /// 内存会话(锁可拿时)补充 token 与摘要状态。
     pub async fn session_list(&self) -> Vec<serde_json::Value> {
-        // 1. 磁盘底表:key -> (count, tokens, has_summary)
-        let mut base: std::collections::HashMap<String, (usize, u64, bool)> =
-            std::collections::HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
-            for e in entries.flatten() {
-                let path = e.path();
-                if path.extension().map(|x| x == "jsonl").unwrap_or(false) {
-                    let key = e
-                        .file_name()
-                        .to_string_lossy()
-                        .trim_end_matches(".jsonl")
-                        .to_string();
-                    let mut count = 0usize;
-                    let mut tokens = 0u64;
-                    let mut has_summary = false;
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        for line in content.lines() {
-                            count += 1;
-                            if !has_summary {
-                                if let Ok(h) = serde_json::from_str::<HistoryMsg>(line) {
-                                    if h.role == "__summary__" {
-                                        has_summary = true;
-                                        continue;
-                                    }
-                                }
-                            }
-                            tokens += serde_json::from_str::<HistoryMsg>(line)
-                                .map(|h| h.tokens as u64)
-                                .unwrap_or(0);
-                        }
-                    }
-                    base.insert(key, (count, tokens, has_summary));
-                }
-            }
-        }
-        // 2. 内存补充(锁可拿时覆盖;拿不到则保持文件数据)
+        let mut list = scan_session_files(&self.sessions_dir);
+        // 内存补充(锁可拿时覆盖;拿不到则保持文件数据)
+        let mut mem: HashMap<String, (usize, u64, bool)> = HashMap::new();
         {
             let map = self.sessions.read().await;
             for (k, s) in map.iter() {
                 if let Ok(s) = s.try_lock() {
-                    let tokens: u64 = s.history.iter().map(|h| h.tokens as u64).sum();
-                    base.insert(
+                    mem.insert(
                         k.clone(),
-                        (
-                            s.history.len(),
-                            tokens + s.summary_tokens as u64,
-                            s.summary.is_some(),
-                        ),
+                        (s.history.len(), s.total_tokens(), s.summary.is_some()),
                     );
                 }
             }
         }
-        // 3. 排序输出
-        let mut list: Vec<serde_json::Value> = base
-            .into_iter()
-            .map(|(key, (count, tokens, has_summary))| {
-                json!({
-                    "key": key,
-                    "count": count,
-                    "tokens": tokens,
-                    "has_summary": has_summary,
-                })
-            })
-            .collect();
-        list.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+        for item in &mut list {
+            let key = item["key"].as_str().unwrap_or("");
+            if let Some((count, tokens, has_summary)) = mem.get(key) {
+                item["count"] = json!(count);
+                item["tokens"] = json!(tokens);
+                item["has_summary"] = json!(has_summary);
+            }
+        }
         list
     }
 
@@ -1124,6 +1179,57 @@ fn pseudo_random() -> f64 {
         .fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed)
         .wrapping_mul(0x2545f4914f6cdd1d);
     (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// 磁盘会话扫描:不依赖内存会话,处理中/未加载的会话也能看到。
+/// 供 session_list 与命令层(机器人未运行时)共用。
+pub fn scan_session_files(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut base: HashMap<String, (usize, u64, bool)> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                let key = e
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".jsonl")
+                    .to_string();
+                let mut count = 0usize;
+                let mut tokens = 0u64;
+                let mut has_summary = false;
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    for line in content.lines() {
+                        count += 1;
+                        if !has_summary {
+                            if let Ok(h) = serde_json::from_str::<HistoryMsg>(line) {
+                                if h.role == "__summary__" {
+                                    has_summary = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        tokens += serde_json::from_str::<HistoryMsg>(line)
+                            .map(|h| h.tokens as u64)
+                            .unwrap_or(0);
+                    }
+                }
+                base.insert(key, (count, tokens, has_summary));
+            }
+        }
+    }
+    let mut list: Vec<serde_json::Value> = base
+        .into_iter()
+        .map(|(key, (count, tokens, has_summary))| {
+            json!({
+                "key": key,
+                "count": count,
+                "tokens": tokens,
+                "has_summary": has_summary,
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    list
 }
 
 pub fn session_key(msg: &ParsedMsg) -> String {

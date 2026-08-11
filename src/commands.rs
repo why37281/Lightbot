@@ -327,7 +327,8 @@ pub async fn get_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<Value
     let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
     match chat {
         Some(c) => Ok(c.session_list().await),
-        None => Ok(Vec::new()),
+        // 机器人未运行时也返回磁盘会话,列表不再依赖运行状态
+        None => Ok(crate::chat::scan_session_files(&state.sessions_dir)),
     }
 }
 
