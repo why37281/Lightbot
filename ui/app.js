@@ -182,13 +182,14 @@ function bindConfigToForm() {
   $("#cfg-decider").checked = c.decider;
   $("#cfg-context").value = c.context_tokens;
   $("#cfg-reserve").value = c.reserve_tokens;
+  $("#cfg-history-target").value = c.history_target_tokens;
   $("#cfg-summarize").checked = c.summarize;
   $("#cfg-summarize-tokens").value = c.summarize_tokens;
   $("#cfg-clean-hours").value = c.clean_after_hours;
   $("#cfg-est-ratio").value = c.estimate_ratio;
   $("#cfg-interject").checked = ij.enabled;
   $("#cfg-interject-mode").value = ij.mode;
-  $("#cfg-interject-cooldown").value = ij.cooldown_secs;
+  $("#cfg-interject-cooldown").value = ij.cooldown_messages;
   $("#cfg-interject-prob").value = Math.round(ij.base_probability * 100);
   $("#cfg-interject-maxtok").value = ij.interject_max_tokens;
   $("#cfg-interject-window").value = ij.activity_window_minutes;
@@ -196,9 +197,14 @@ function bindConfigToForm() {
   $("#cfg-names").value = ij.names;
   $("#cfg-hooks").value = ij.hooks;
   $("#cfg-memory").checked = c.memory.enabled;
+  $("#cfg-mem-placement").value = c.memory.placement;
   $("#cfg-mem-max").value = c.memory.max_entries;
   $("#cfg-mem-chars").value = c.memory.max_entry_chars;
   $("#cfg-mem-tokens").value = c.memory.max_tokens;
+  $("#cfg-trail").checked = c.trail.enabled;
+  $("#cfg-trail-window").value = c.trail.window_minutes;
+  $("#cfg-trail-max").value = c.trail.max_entries;
+  $("#cfg-trail-tokens").value = c.trail.max_tokens;
   syncModeFields();
 }
 
@@ -220,15 +226,16 @@ function collectForm() {
   c.enable_group = $("#cfg-enable-group").checked;
   c.enable_private = $("#cfg-enable-private").checked;
   c.decider = $("#cfg-decider").checked;
-  c.context_tokens = parseInt($("#cfg-context").value) || 8192;
+  c.context_tokens = parseInt($("#cfg-context").value) || 65536;
   c.reserve_tokens = parseInt($("#cfg-reserve").value) || 1024;
+  c.history_target_tokens = parseInt($("#cfg-history-target").value) || 0;
   c.summarize = $("#cfg-summarize").checked;
   c.summarize_tokens = parseInt($("#cfg-summarize-tokens").value) || 600;
   c.clean_after_hours = parseInt($("#cfg-clean-hours").value) || 0;
   c.estimate_ratio = parseFloat($("#cfg-est-ratio").value) || 1.15;
   ij.enabled = $("#cfg-interject").checked;
   ij.mode = $("#cfg-interject-mode").value;
-  ij.cooldown_secs = parseInt($("#cfg-interject-cooldown").value) || 90;
+  ij.cooldown_messages = parseInt($("#cfg-interject-cooldown").value) || 25;
   ij.base_probability = (parseFloat($("#cfg-interject-prob").value) || 5) / 100;
   ij.interject_max_tokens = parseInt($("#cfg-interject-maxtok").value) || 120;
   ij.activity_window_minutes = parseInt($("#cfg-interject-window").value) || 2;
@@ -236,9 +243,14 @@ function collectForm() {
   ij.names = $("#cfg-names").value.trim();
   ij.hooks = $("#cfg-hooks").value.trim();
   c.memory.enabled = $("#cfg-memory").checked;
+  c.memory.placement = $("#cfg-mem-placement").value;
   c.memory.max_entries = parseInt($("#cfg-mem-max").value) || 30;
   c.memory.max_entry_chars = parseInt($("#cfg-mem-chars").value) || 200;
   c.memory.max_tokens = parseInt($("#cfg-mem-tokens").value) || 1200;
+  c.trail.enabled = $("#cfg-trail").checked;
+  c.trail.window_minutes = parseInt($("#cfg-trail-window").value) || 5;
+  c.trail.max_entries = parseInt($("#cfg-trail-max").value) || 10;
+  c.trail.max_tokens = parseInt($("#cfg-trail-tokens").value) || 800;
   cfg.active_model = $("#cfg-active-model").value;
   cfg.active_prompt = $("#cfg-active-prompt").value;
   return cfg;

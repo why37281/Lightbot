@@ -175,8 +175,12 @@ pub struct ChatConfig {
     /// 回复决策器:任何触发命中后,先由当前模型判断是否需要回复(默认关闭;
     /// 每次触发增加一次轻量模型调用)
     pub decider: bool,
+    /// 近期历史主动折叠阈值(token):历史超过该值就折叠进摘要(0 = 仅在超总预算时折叠)
+    pub history_target_tokens: u32,
     /// 长期记忆系统配置
     pub memory: MemoryConfig,
+    /// 群聊轨迹(未触发消息缓冲)配置
+    pub trail: TrailConfig,
     /// 主动插话(活人感)配置
     pub interject: InterjectConfig,
 }
@@ -184,7 +188,7 @@ pub struct ChatConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
-            context_tokens: 8192,
+            context_tokens: 65536,
             reserve_tokens: 1024,
             enable_group: true,
             enable_private: true,
@@ -193,7 +197,9 @@ impl Default for ChatConfig {
             clean_after_hours: 24,
             estimate_ratio: 1.15,
             decider: false,
+            history_target_tokens: 8192,
             memory: MemoryConfig::default(),
+            trail: TrailConfig::default(),
             interject: InterjectConfig::default(),
         }
     }
@@ -211,6 +217,11 @@ pub struct MemoryConfig {
     pub max_entry_chars: u32,
     /// 记忆总 token 上限(超出删最旧;保护上下文预算)
     pub max_tokens: u32,
+    /// 记忆消息位置:
+    ///  "front" 摘要后/历史前 —— 记忆与历史都命中缓存,但记忆变更会断一次历史;
+    ///  "back"  历史后/提问前 —— 记忆变更不影响历史,但历史增长使记忆每轮 miss。
+    /// 建议配合 history_target_tokens(主动折叠)使用 "front"。
+    pub placement: String,
 }
 
 impl Default for MemoryConfig {
@@ -220,6 +231,34 @@ impl Default for MemoryConfig {
             max_entries: 30,
             max_entry_chars: 200,
             max_tokens: 1200,
+            placement: "front".into(),
+        }
+    }
+}
+
+/// 群聊轨迹配置:未触发对话的普通消息短期缓冲,
+/// 触发对话时拼在提问前,让机器人知道群里刚说了什么(解决"鱼的记忆")。
+/// 轨迹消息位于记忆之后、提问之前,变化只影响自身与提问,不影响历史/记忆前缀。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct TrailConfig {
+    /// 总开关
+    pub enabled: bool,
+    /// 轨迹窗口(分钟),窗口外的消息过期
+    pub window_minutes: u64,
+    /// 最多保留条数(超出丢最旧)
+    pub max_entries: u32,
+    /// 轨迹总 token 上限(超出丢最旧,保护成本)
+    pub max_tokens: u32,
+}
+
+impl Default for TrailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_minutes: 5,
+            max_entries: 10,
+            max_tokens: 800,
         }
     }
 }
@@ -233,8 +272,9 @@ pub struct InterjectConfig {
     pub enabled: bool,
     /// 模式: "adaptive" 按群活跃度自适应 / "fixed" 固定概率
     pub mode: String,
-    /// 两次主动发言的最小间隔(秒),软 at 也会刷新它
-    pub cooldown_secs: u64,
+    /// 插话冷却:距上次主动发言以来,群里新消息达到该条数才允许再次插话
+    /// (比固定时间更符合群聊节奏:活跃群攒得快,冷清群自然少插话)
+    pub cooldown_messages: u32,
     /// 基线概率(0.0~1.0),命中钩子词加分、纯水消息减分
     pub base_probability: f64,
     /// 插话输出上限 tokens(轻量通道,保持低成本)
@@ -254,7 +294,7 @@ impl Default for InterjectConfig {
         Self {
             enabled: true,
             mode: "adaptive".into(),
-            cooldown_secs: 90,
+            cooldown_messages: 25,
             base_probability: 0.05,
             interject_max_tokens: 120,
             activity_window_minutes: 2,
@@ -371,6 +411,6 @@ mod tests {
         let s = r#"{"napcat":{"ws_url":"ws://x:1"},"models":[],"chat":{},"prompts":[]}"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert_eq!(cfg.napcat.reverse_port, 3005);
-        assert_eq!(cfg.chat.context_tokens, 8192);
+        assert_eq!(cfg.chat.context_tokens, 65536);
     }
 }

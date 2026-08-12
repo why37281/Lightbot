@@ -223,8 +223,12 @@ pub struct ChatCore {
     pub events: mpsc::Sender<FrontendEvent>,
     /// 群活跃度跟踪:key -> 最近 5 分钟消息时间戳(插话采样用)
     pub activity: StdMutex<HashMap<String, VecDeque<Instant>>>,
-    /// 每群最近一次主动发言时间(插话冷却,软 at 也会刷新)
-    pub interject_at: StdMutex<HashMap<String, Instant>>,
+    /// 每群消息计数(插话条数冷却)
+    pub msg_count: StdMutex<HashMap<String, u64>>,
+    /// 每群最近一次主动发言时的消息计数(插话冷却,软 at 也会刷新)
+    pub interject_at: StdMutex<HashMap<String, u64>>,
+    /// 群聊轨迹:未触发对话的普通消息缓冲(key -> (时间, 文本))
+    pub trail: StdMutex<HashMap<String, VecDeque<(SystemTime, String)>>>,
 }
 
 impl ChatCore {
@@ -244,7 +248,9 @@ impl ChatCore {
             cfg_path,
             events,
             activity: StdMutex::new(HashMap::new()),
+            msg_count: StdMutex::new(HashMap::new()),
             interject_at: StdMutex::new(HashMap::new()),
+            trail: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -298,6 +304,8 @@ impl ChatCore {
             && self.interject_sample(&key, &user_text).await
         {
             drop(cfg);
+            // 插话消息未进历史,记录到轨迹
+            self.record_trail(&key, &msg.text).await;
             if self.decider_ok(&user_text).await {
                 self.log("info", &format!("[{key}] 主动插话: {user_text}"));
                 self.light_reply(&msg, &user_text).await;
@@ -307,12 +315,28 @@ impl ChatCore {
                 self.log("info", &format!("[{key}] 决策器:无需回复(插话)"));
             }
         } else {
-            // 全部触发条件未命中
+            // 全部触发条件未命中:记录群聊轨迹(解决"鱼的记忆")
             self.log(
                 "debug",
                 &format!("[{key}] 未触发回复逻辑: {}", msg.text),
             );
+            self.record_trail(&key, &msg.text).await;
         }
+    }
+
+    /// 记录群聊轨迹(仅群聊;窗口与条数取自配置)
+    async fn record_trail(&self, key: &str, text: &str) {
+        if !key.starts_with('g') {
+            return;
+        }
+        let (win, max) = {
+            let cfg = self.cfg.read().await;
+            (
+                cfg.chat.trail.window_minutes.max(1) * 60,
+                cfg.chat.trail.max_entries as usize,
+            )
+        };
+        self.trail_push(key, text, win, max);
     }
 
     /// 决策器:开启时由当前模型判断这条消息是否需要回复。
@@ -379,15 +403,18 @@ impl ChatCore {
         self.trim_context(&mut session, &user_text).await;
 
         // 组装消息(缓存友好顺序):
-        // [人设][记忆说明] [摘要] [历史] [记忆内容] [提问]
-        // 记忆放在历史之后、提问之前:新记忆追加时公共前缀 = 人设+说明+摘要+历史(大头),
-        // 缓存几乎全部命中;若记忆在摘要前,新增记忆会让中间消息变长,摘要+历史缓存全断。
-        let (prompt, model, mem_cfg) = {
+        // [人设][记忆说明][摘要][记忆(front)][历史][记忆(back)][轨迹][提问]
+        // 记忆位置由配置决定:front = 摘要后/历史前(记忆与历史都命中,记忆变更断历史一次);
+        // back = 历史后(记忆变更不影响历史,但历史增长使记忆每轮 miss)。
+        // 轨迹(未触发消息)总在最后,变化只影响自身与提问。
+        let (prompt, model, mem_cfg, trail_cfg, ratio) = {
             let cfg = self.cfg.read().await;
             (
                 cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
                 cfg.active_model().cloned(),
                 cfg.chat.memory.clone(),
+                cfg.chat.trail.clone(),
+                cfg.chat.estimate_ratio,
             )
         };
         let Some(model) = model else {
@@ -412,13 +439,8 @@ impl ChatCore {
                 content: format!("[先前对话摘要]\n{s}"),
             });
         }
-        for h in &session.history {
-            msgs.push(ApiMessage {
-                role: h.role.clone(),
-                content: h.text.clone(),
-            });
-        }
-        // 记忆内容消息:位于历史之后、提问之前(追加/删除几乎不影响摘要+历史缓存)
+        // 记忆内容:按 placement 决定插在摘要后(历史前)还是历史后
+        let mut mem_msg: Option<ApiMessage> = None;
         if mem_cfg.enabled {
             session.memory.refresh();
             self.log(
@@ -426,9 +448,47 @@ impl ChatCore {
                 &format!("[{key}] 记忆: {} 条", session.memory.entries.len()),
             );
             if !session.memory.entries.is_empty() {
-                msgs.push(ApiMessage {
+                mem_msg = Some(ApiMessage {
                     role: "system".into(),
                     content: session.memory.system_text(),
+                });
+            }
+        }
+        if mem_cfg.placement != "back" {
+            if let Some(m) = mem_msg.clone() {
+                msgs.push(m);
+            }
+        }
+        for h in &session.history {
+            msgs.push(ApiMessage {
+                role: h.role.clone(),
+                content: h.text.clone(),
+            });
+        }
+        if mem_cfg.placement == "back" {
+            if let Some(m) = mem_msg {
+                msgs.push(m);
+            }
+        }
+        // 群聊轨迹:最近未触发消息(位于最后,变化不影响历史/记忆缓存)
+        if trail_cfg.enabled && msg.kind == MsgKind::Group {
+            let lines = {
+                self.trail
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            if let Some(content) = render_trail(
+                &lines,
+                trail_cfg.window_minutes.max(1) * 60,
+                trail_cfg.max_tokens,
+                ratio,
+            ) {
+                msgs.push(ApiMessage {
+                    role: "user".into(),
+                    content,
                 });
             }
         }
@@ -597,7 +657,7 @@ impl ChatCore {
         }
     }
 
-    /// 记录群活跃度(滑动窗口,跨度可配置)
+    /// 记录群活跃度(滑动窗口,跨度可配置),同时递增消息计数(插话冷却用)
     fn track_activity(&self, key: &str, window_secs: u64) {
         let mut m = self.activity.lock().unwrap();
         let q = m.entry(key.to_string()).or_default();
@@ -607,6 +667,13 @@ impl ChatCore {
             q.pop_front();
         }
         q.push_back(now);
+        drop(m);
+        *self
+            .msg_count
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert(0) += 1;
     }
 
     /// 消息速率(条/分钟):窗口内消息数 / 窗口分钟数
@@ -618,10 +685,31 @@ impl ChatCore {
     }
 
     fn mark_interjected(&self, key: &str) {
+        let count = self.msg_count.lock().unwrap().get(key).copied().unwrap_or(0);
         self.interject_at
             .lock()
             .unwrap()
-            .insert(key.to_string(), Instant::now());
+            .insert(key.to_string(), count);
+    }
+
+    /// 记录群聊轨迹(未触发对话的消息),按窗口与条数限制
+    fn trail_push(&self, key: &str, text: &str, window_secs: u64, max_entries: usize) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut m = self.trail.lock().unwrap();
+        let q = m.entry(key.to_string()).or_default();
+        let now = SystemTime::now();
+        q.retain(|(t, _)| {
+            now.duration_since(*t)
+                .map(|d| d.as_secs() < window_secs)
+                .unwrap_or(false)
+        });
+        q.push_back((now, text.to_string()));
+        while q.len() > max_entries.max(1) {
+            q.pop_front();
+        }
     }
 
     /// 插话采样:开关 + 冷却 + 概率(基线/钩子词/水消息 + 活跃度缩放)
@@ -631,16 +719,15 @@ impl ChatCore {
         if !ij.enabled || ij.mode == "off" {
             return false;
         }
-        let cooldown = Duration::from_secs(ij.cooldown_secs.max(1));
-        let now = Instant::now();
+        // 冷却:距上次主动发言以来,群里新消息达到 cooldown_messages 条才允许插话
+        let count = self.msg_count.lock().unwrap().get(key).copied().unwrap_or(0);
+        let need = ij.cooldown_messages.max(1) as u64;
         if let Some(last) = self.interject_at.lock().unwrap().get(key) {
-            if now.duration_since(*last) < cooldown {
+            let since = count.saturating_sub(*last);
+            if since < need {
                 self.log(
                     "debug",
-                    &format!(
-                        "[{key}] 插话采样: 冷却中,剩余 {}s",
-                        cooldown.as_secs() - now.duration_since(*last).as_secs()
-                    ),
+                    &format!("[{key}] 插话采样: 冷却中,还差 {} 条消息", need - since),
                 );
                 return false;
             }
@@ -880,7 +967,7 @@ impl ChatCore {
 
     /// 上下文预算管理:缓存友好截断 + 可选摘要折叠
     async fn trim_context(&self, session: &mut Session, user_text: &str) {
-        let (budget, summarize, summarize_tokens, ratio, prompt, mem_cfg) = {
+        let (budget, summarize, summarize_tokens, ratio, prompt, mem_cfg, history_target) = {
             let cfg = self.cfg.read().await;
             (
                 cfg.chat.context_tokens.saturating_sub(cfg.chat.reserve_tokens) as u64,
@@ -889,6 +976,7 @@ impl ChatCore {
                 cfg.chat.estimate_ratio,
                 cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
                 cfg.chat.memory.clone(),
+                cfg.chat.history_target_tokens,
             )
         };
         let (prompt_tok, user_tok) = {
@@ -929,7 +1017,15 @@ impl ChatCore {
         let mut hist_budget = input_budget.saturating_sub(sum_tok);
         let overflow = hist_tok.saturating_sub(hist_budget);
 
-        if overflow == 0 {
+        // 主动折叠目标:history_target_tokens(>0 时启用,配合记忆 front 策略保持缓存最优)
+        let fold_budget = if history_target > 0 {
+            hist_budget.min(history_target as u64)
+        } else {
+            hist_budget
+        };
+        let need_fold =
+            summarize && session.history.len() > 2 && (hist_tok > fold_budget || overflow > 0);
+        if !need_fold {
             return;
         }
 
@@ -937,7 +1033,7 @@ impl ChatCore {
             // 第一轮:把要丢的部分折叠进摘要(预留摘要空间,并至少丢 2 条)
             let drop = compute_drop(
                 &session.history.iter().map(|h| h.tokens).collect::<Vec<_>>(),
-                hist_budget,
+                fold_budget,
                 1,
             )
             .max(2);
@@ -1099,14 +1195,17 @@ impl ChatCore {
             tokio::select! {
                 _ = stop.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    // 插话状态清理:保留一天内的冷却记录,活跃度只留非空队列
+                    // 轨迹清理:过期条目与空队列(msg_count/interject_at 为累计计数,保留)
                     {
-                        let now = Instant::now();
-                        let day = Duration::from_secs(86400);
-                        self.interject_at
-                            .lock()
-                            .unwrap()
-                            .retain(|_, t| now.duration_since(*t) < day);
+                        let now = SystemTime::now();
+                        self.trail.lock().unwrap().retain(|_, q| {
+                            q.retain(|(t, _)| {
+                                now.duration_since(*t)
+                                    .map(|d| d.as_secs() < 86400)
+                                    .unwrap_or(false)
+                            });
+                            !q.is_empty()
+                        });
                         self.activity.lock().unwrap().retain(|_, q| !q.is_empty());
                     }
                     let hours = self.cfg.read().await.chat.clean_after_hours;
@@ -1179,6 +1278,51 @@ fn pseudo_random() -> f64 {
         .fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed)
         .wrapping_mul(0x2545f4914f6cdd1d);
     (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// 渲染群聊轨迹为一条 user 消息内容(窗口过滤 + 从最新截断到 max_tokens)
+pub fn render_trail(
+    lines: &VecDeque<(SystemTime, String)>,
+    window_secs: u64,
+    max_tokens: u32,
+    ratio: f64,
+) -> Option<String> {
+    let now = SystemTime::now();
+    let mut rendered: Vec<String> = Vec::new();
+    for (t, text) in lines {
+        if now
+            .duration_since(*t)
+            .map(|d| d.as_secs() < window_secs)
+            .unwrap_or(false)
+        {
+            let hhmm = chrono::DateTime::<chrono::Local>::from(*t)
+                .format("%H:%M")
+                .to_string();
+            rendered.push(format!("[{hhmm}] {text}"));
+        }
+    }
+    if rendered.is_empty() {
+        return None;
+    }
+    // 从最新往前保留,直到 token 上限
+    let mut total = 0u32;
+    let mut kept: Vec<&String> = Vec::new();
+    for line in rendered.iter().rev() {
+        total = total.saturating_add(estimate_tokens(line, ratio));
+        if total > max_tokens.max(1) {
+            break;
+        }
+        kept.push(line);
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let mut content = String::from("[群聊最近消息]\n");
+    for line in kept.into_iter().rev() {
+        content.push_str(line);
+        content.push('\n');
+    }
+    Some(content)
 }
 
 /// 磁盘会话扫描:不依赖内存会话,处理中/未加载的会话也能看到。
@@ -1269,6 +1413,28 @@ mod tests {
         assert_eq!(compute_drop(&toks, 0, 2), 3);
         // 单条超大:全丢也要保留 min_keep
         assert_eq!(compute_drop(&[1000], 10, 1), 0);
+    }
+
+    #[test]
+    fn trail_render() {
+        let now = SystemTime::now();
+        let lines = vec![
+            (now, "你好".to_string()),
+            (now, "令牌:abc".to_string()),
+        ];
+        let out = render_trail(&VecDeque::from(lines.clone()), 300, 800, 1.0).unwrap();
+        assert!(out.starts_with("[群聊最近消息]"));
+        assert!(out.contains("你好"));
+        assert!(out.contains("令牌"));
+        assert!(out.contains('[')); // 时间戳格式 [HH:MM]
+        // token 上限较小:只保留最新一条(旧的一条放不下)
+        let out2 = render_trail(&VecDeque::from(lines), 300, 10, 1.0).unwrap();
+        assert!(out2.contains("令牌"));
+        assert!(!out2.contains("你好"));
+        // 过期消息被过滤
+        let old = now - Duration::from_secs(600);
+        let lines2 = vec![(old, "过期".to_string())];
+        assert!(render_trail(&VecDeque::from(lines2), 300, 800, 1.0).is_none());
     }
 
     #[test]

@@ -166,10 +166,13 @@
           <input id="cfg-decider" type="checkbox" />
         </label>
         <label>单会话上下文预算(token,输入上限)
-          <input id="cfg-context" type="number" min="512" max="128000" />
+          <input id="cfg-context" type="number" min="512" max="131072" />
         </label>
         <label>回复预留 token
           <input id="cfg-reserve" type="number" min="64" max="8192" />
+        </label>
+        <label>近期历史主动折叠阈值(token,0=禁用)
+          <input id="cfg-history-target" type="number" min="0" max="65536" />
         </label>
         <label class="check">超预算时用 LLM 折叠旧消息为摘要(缓存友好)
           <input id="cfg-summarize" type="checkbox" />
@@ -188,10 +191,34 @@
         <p>💡 缓存友好机制:人设固定在最前 → 超预算只删最旧消息 → 前缀保持稳定,DeepSeek 自动命中缓存。摘要折叠后继续追加,前缀依旧稳定。</p>
         <p>💡 回复决策器:任何触发(@/软 at/插话)命中后,先用当前模型快速判断这条消息是否值得回复,不需要则静默跳过。代价是每次触发多一次轻量调用(非思考、16 tokens 输出);决策失败时保守回复,不会漏回消息。</p>
       </div>
+      <h3>群聊轨迹(最近消息上下文)</h3>
+      <div class="form-grid narrow">
+        <label class="check">启用群聊轨迹(未 @ 的消息也进上下文)
+          <input id="cfg-trail" type="checkbox" />
+        </label>
+        <label>轨迹窗口(分钟)
+          <input id="cfg-trail-window" type="number" min="1" max="60" />
+        </label>
+        <label>最多条数
+          <input id="cfg-trail-max" type="number" min="1" max="50" />
+        </label>
+        <label>轨迹 token 上限
+          <input id="cfg-trail-tokens" type="number" min="64" max="4000" />
+        </label>
+      </div>
+      <div class="tips">
+        <p>💡 群聊轨迹:未 @ / 未提及的普通消息会被短暂记录,触发对话时拼在提问前——机器人记得"群里刚说了什么",不再有"鱼的记忆"。位于消息流末尾,不影响历史与记忆的缓存命中。</p>
+      </div>
       <h3>长期记忆</h3>
       <div class="form-grid narrow">
         <label class="check">启用记忆系统(模型可自动写入)
           <input id="cfg-memory" type="checkbox" />
+        </label>
+        <label>记忆位置
+          <select id="cfg-mem-placement">
+            <option value="front">历史前(记忆+历史都命中缓存)</option>
+            <option value="back">历史后(记忆变更不影响历史)</option>
+          </select>
         </label>
         <label>记忆条数上限
           <input id="cfg-mem-max" type="number" min="1" max="200" />
@@ -221,8 +248,8 @@
             <option value="fixed">固定概率</option>
           </select>
         </label>
-        <label>冷却时间(秒)
-          <input id="cfg-interject-cooldown" type="number" min="1" max="86400" />
+        <label>插话冷却(距上次发言的消息条数)
+          <input id="cfg-interject-cooldown" type="number" min="1" max="1000" />
         </label>
         <label>基线概率(%)
           <input id="cfg-interject-prob" type="number" min="0" max="60" step="1" />
