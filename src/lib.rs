@@ -26,6 +26,7 @@ pub fn run() {
             commands::test_llm,
             commands::get_sessions,
             commands::clear_session,
+            commands::clear_trace,
             commands::get_session_detail,
             commands::update_history_msg,
             commands::delete_history_msg,

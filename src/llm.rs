@@ -283,7 +283,7 @@ impl LlmClient {
     }
 
     /// 决策请求:判断这条消息是否需要回复。
-    /// 用当前模型,但强制关闭思考模式、极小输出(16 tokens),开销接近一次 ping。
+    /// 思考模式与推理强度跟随模型配置(先思考,再输出字母);仅输出上限 32 tokens。
     /// 上下文只带人设 + 当前消息(附触发说明),不带历史(决策只看当下值不值得回)。
     /// 返回(结论, usage)。
     pub async fn decide(
@@ -294,10 +294,9 @@ impl LlmClient {
         trigger_hint: &str,
     ) -> Result<(bool, Usage), String> {
         let mut m2 = m.clone();
-        m2.thinking = "disabled".into();
-        m2.max_tokens = 16;
+        m2.max_tokens = 32;
         let msgs = build_decide_messages(prompt, text, trigger_hint);
-        let reply = self.chat(&m2, &msgs, Some(16)).await?;
+        let reply = self.chat(&m2, &msgs, Some(32)).await?;
         Ok((parse_decision(&reply.text), reply.usage))
     }
 }
@@ -440,6 +439,7 @@ pub fn build_decide_messages(prompt: &str, text: &str, trigger_hint: &str) -> Ve
                 "{prompt}\n\n(你是这个群里的一员,下面是可能触发你回复的消息。判断你是否需要回复:\n\
                  - 消息 @ 了你、引用回复了你、是发给你的私聊、明确提问/求助/提到你的称呼 → 需要回复;\n\
                  - 纯闲聊、与你无关、无需回应 → 不需要回复。\n\
+                 思考过程请保持简短:只需想清楚是否需要回复、以及如果需要的话大致回复什么即可。\n\
                  只输出一个字母:需要回复输出 Y,不需要输出 N。)"
             ),
         },

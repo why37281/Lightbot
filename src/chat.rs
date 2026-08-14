@@ -43,6 +43,10 @@ use crate::trigger;
 /// ⚠️ 此文本内容改动会破坏缓存前缀,勿随意修改。
 pub const MEMORY_GUIDE: &str = "(你可以管理长期记忆:当你了解到值得长期记住的信息(用户偏好、重要事实、约定)时,在回复末尾用标记 [记忆:添加 内容] 写入;需要删除时用 [记忆:删除 内容片段]。不要写入临时性信息,每次只写最重要的。)";
 
+/// 思考长度约束:恒定的独立 system 消息(与思考开关无关,缓存前缀稳定)。
+/// ⚠️ 此文本内容改动会破坏缓存前缀,勿随意修改。
+pub const THINKING_GUIDE: &str = "(思考过程请保持简短:只需要确定接下来该回复什么即可,不要展开长篇推理。)";
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendEvent {
@@ -393,7 +397,8 @@ impl ChatCore {
         });
     }
 
-    fn set_status(&self, key: &str, s: SessionStatus) {
+    /// 会话状态变化:状态表更新 + 事件(await 发送,确保前端状态灯/胶囊不因通道满而丢失)
+    async fn set_status(&self, key: &str, s: SessionStatus) {
         {
             let mut m = self.status.lock().unwrap();
             let cur = m.entry(key.to_string()).or_insert(SessionStatus::Idle);
@@ -402,10 +407,13 @@ impl ChatCore {
             }
             *cur = s;
         }
-        let _ = self.events.try_send(FrontendEvent::SessionStatus {
-            key: key.to_string(),
-            status: s.as_str().to_string(),
-        });
+        let _ = self
+            .events
+            .send(FrontendEvent::SessionStatus {
+                key: key.to_string(),
+                status: s.as_str().to_string(),
+            })
+            .await;
     }
 
     pub fn get_status(&self, key: &str) -> SessionStatus {
@@ -419,16 +427,20 @@ impl ChatCore {
 
     // ---------- 轨迹与费用 ----------
 
-    fn trace_push(&self, key: &str, ev: &TraceEvent) {
-        let _ = self.events.try_send(FrontendEvent::Trace {
-            key: key.to_string(),
-            entry: ev.clone(),
-        });
+    async fn trace_push(&self, key: &str, ev: &TraceEvent) {
+        let _ = self
+            .events
+            .send(FrontendEvent::Trace {
+                key: key.to_string(),
+                entry: ev.clone(),
+            })
+            .await;
         let store = TraceStore::new(self.trace_dir.join(format!("{key}.jsonl")));
         store.push(ev);
     }
 
     fn turn_delta(&self, key: &str, turn: &str, kind: &str, text: &str) {
+        // 增量事件允许丢弃(通道满时):最终全量由 Trace(MsgOut/Think) 修正
         let _ = self.events.try_send(FrontendEvent::TurnDelta {
             key: key.to_string(),
             turn: turn.to_string(),
@@ -453,16 +465,19 @@ impl ChatCore {
         });
     }
 
-    fn emit_llm_stats(&self, model: &ModelConfig, usage: &Usage, elapsed_ms: u64) {
-        let _ = self.events.try_send(FrontendEvent::LlmStats {
-            model: model.model.clone(),
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            cache_hit: usage.cache_hit,
-            cache_miss: usage.cache_miss,
-            reasoning_tokens: usage.reasoning_tokens,
-            elapsed_ms,
-        });
+    async fn emit_llm_stats(&self, model: &ModelConfig, usage: &Usage, elapsed_ms: u64) {
+        let _ = self
+            .events
+            .send(FrontendEvent::LlmStats {
+                model: model.model.clone(),
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                cache_hit: usage.cache_hit,
+                cache_miss: usage.cache_miss,
+                reasoning_tokens: usage.reasoning_tokens,
+                elapsed_ms,
+            })
+            .await;
     }
 
     /// 记忆发生变更时递增计数(模型写入/删除、/remember、/forget、GUI 增删)
@@ -499,7 +514,8 @@ impl ChatCore {
                     text: msg.text.clone(),
                     ignored: true,
                 },
-            );
+            )
+            .await;
             return;
         }
 
@@ -536,7 +552,8 @@ impl ChatCore {
                         text: msg.text.clone(),
                         ignored: true,
                     },
-                );
+                )
+                .await;
             }
             return;
         }
@@ -552,18 +569,27 @@ impl ChatCore {
             }
             return;
         }
-        // ③ 插话采样 → 轻量通道(群聊,概率 + 冷却;决策器通过才插话)
+        // ③ 插话采样 → 轻量通道(群聊,概率/固定频率 + 冷却;决策器通过才插话)
         let user_text = trigger::strip_keyword(&msg.text, &cfg.napcat.keyword).to_string();
         if msg.kind == MsgKind::Group
             && !user_text.is_empty()
             && self.interject_sample(&key, &user_text).await
         {
             drop(cfg);
-            // 插话消息未进历史,记录到轨迹
-            self.record_trail(&key, &msg.text).await;
             if self.decider_ok(&key, &turn, &user_text, "主动插话采样命中(是否接话)").await {
                 self.log("info", &format!("[{key}] 主动插话: {user_text}"));
-                self.light_reply(&msg, &user_text, &turn).await;
+                // 完整上下文开关:开启后插话走完整通道(历史/记忆/轨迹按设置注入,并记入历史);
+                // 关闭则走轻量通道(单轮、不落盘)。完整通道的消息不进轨迹,避免重复注入。
+                let full_context = {
+                    let c = self.cfg.read().await;
+                    c.chat.interject.full_context
+                };
+                if full_context {
+                    self.full_dialogue(&key, &msg, &turn).await;
+                } else {
+                    self.record_trail(&key, &msg.text).await;
+                    self.light_reply(&msg, &user_text, &turn).await;
+                }
             } else {
                 // 决策拒绝也消耗本次插话机会,防止高频重试
                 self.mark_interjected(&key);
@@ -628,15 +654,15 @@ impl ChatCore {
         let Some(model) = model else {
             return true;
         };
-        self.set_status(key, SessionStatus::Deciding);
+        self.set_status(key, SessionStatus::Deciding).await;
         let started = Instant::now();
         let result = self.llm.decide(&model, &prompt, text, trigger_hint).await;
-        self.set_status(key, SessionStatus::Idle);
+        self.set_status(key, SessionStatus::Idle).await;
         let ms = started.elapsed().as_millis() as u64;
         match result {
             Ok((yes, usage)) => {
                 self.record_usage(&model, "decide", &usage);
-                self.emit_llm_stats(&model, &usage, ms);
+                self.emit_llm_stats(&model, &usage, ms).await;
                 self.trace_push(
                     key,
                     &TraceEvent::Decide {
@@ -647,7 +673,8 @@ impl ChatCore {
                         model: model.model.clone(),
                         ms,
                     },
-                );
+                )
+                .await;
                 self.log(
                     "info",
                     &format!(
@@ -667,7 +694,8 @@ impl ChatCore {
                         ts: trace::now_ts(),
                         text: format!("决策器失败: {e}"),
                     },
-                );
+                )
+                .await;
                 true
             }
         }
@@ -700,7 +728,8 @@ impl ChatCore {
                         text: text.to_string(),
                         reply,
                     },
-                );
+                )
+                .await;
                 return;
             }
         }
@@ -767,10 +796,11 @@ impl ChatCore {
                 text: user_text.clone(),
                 ignored: false,
             },
-        );
+        )
+        .await;
 
         // 回复中 → 流式调用(思考中/回复中由增量自动切换;首 token 前的等待算回复中)
-        self.set_status(key, SessionStatus::Replying);
+        self.set_status(key, SessionStatus::Replying).await;
         let started = Instant::now();
         let (abort_tx, abort_rx) = watch::channel(false);
         self.aborts.lock().unwrap().insert(key.to_string(), abort_tx);
@@ -780,13 +810,13 @@ impl ChatCore {
             .await;
 
         self.aborts.lock().unwrap().remove(key);
-        self.set_status(key, SessionStatus::Idle);
+        self.set_status(key, SessionStatus::Idle).await;
 
         match stream_result {
             Ok(reply) => {
                 self.record_usage(&model, "dialogue", &reply.usage);
                 let elapsed = started.elapsed().as_millis() as u64;
-                self.emit_llm_stats(&model, &reply.usage, elapsed);
+                self.emit_llm_stats(&model, &reply.usage, elapsed).await;
                 self.log(
                     "info",
                     &format!(
@@ -812,7 +842,8 @@ impl ChatCore {
                             text: reply.reasoning.clone(),
                             tokens: reply.usage.reasoning_tokens,
                         },
-                    );
+                    )
+                    .await;
                 }
                 // 记忆标记:总是剥离(防止关闭状态泄漏到群里);仅开启时执行
                 let mut out = reply.text;
@@ -864,7 +895,8 @@ impl ChatCore {
                         model: model.model.clone(),
                         usage: reply.usage.clone(),
                     },
-                );
+                )
+                .await;
                 if let Err(e) = send_result {
                     self.log("warn", &format!("[{key}] 回复发送失败: {e}"));
                 }
@@ -885,7 +917,8 @@ impl ChatCore {
                             e.clone()
                         },
                     },
-                );
+                )
+                .await;
                 if stopped {
                     // 已发过"思考中"提示则补一条停止告知,否则静默(用户自己按的停止)
                     if pending_sent {
@@ -936,7 +969,7 @@ impl ChatCore {
                             if first_token_at.is_none() {
                                 first_token_at = Some(Instant::now());
                             }
-                            self.set_status(key, SessionStatus::Thinking);
+                            self.set_status(key, SessionStatus::Thinking).await;
                             self.turn_delta(key, turn, "think", &delta);
                         }
                         Some(Ok(StreamEvent::Content { delta })) => {
@@ -944,7 +977,7 @@ impl ChatCore {
                                 first_token_at = Some(Instant::now());
                             }
                             got_content = true;
-                            self.set_status(key, SessionStatus::Replying);
+                            self.set_status(key, SessionStatus::Replying).await;
                             self.turn_delta(key, turn, "out", &delta);
                         }
                     }
@@ -990,6 +1023,10 @@ impl ChatCore {
             ApiMessage {
                 role: "system".into(),
                 content: MEMORY_GUIDE.to_string(),
+            },
+            ApiMessage {
+                role: "system".into(),
+                content: THINKING_GUIDE.to_string(),
             },
         ];
         if let Some(s) = &session.summary {
@@ -1084,7 +1121,7 @@ impl ChatCore {
             ApiMessage {
                 role: "system".into(),
                 content: format!(
-                    "{prompt}\n\n(现在是群聊中的随口插话场景:请用一两句话自然、口语化地回应,不要称呼任何人,不要使用列表或长篇大论。)"
+                    "{prompt}\n\n(现在是群聊中的随口插话场景:请用一两句话自然、口语化地回应,不要称呼任何人,不要使用列表或长篇大论。\n思考过程请保持简短:只需要确定该接什么话即可。)"
                 ),
             },
             ApiMessage {
@@ -1096,7 +1133,7 @@ impl ChatCore {
         match self.llm.chat(&model, &msgs, Some(max_tokens)).await {
             Ok(reply) => {
                 self.record_usage(&model, "interject", &reply.usage);
-                self.emit_llm_stats(&model, &reply.usage, started.elapsed().as_millis() as u64);
+                self.emit_llm_stats(&model, &reply.usage, started.elapsed().as_millis() as u64).await;
                 // 插话场景剥离记忆标记但不执行(轻量通道不管理记忆)
                 let (text, _) = memory::parse_memory_ops(&reply.text);
                 let out = if text.is_empty() {
@@ -1113,7 +1150,8 @@ impl ChatCore {
                         text: out,
                         model: model.model.clone(),
                     },
-                );
+                )
+                .await;
             }
             Err(e) => {
                 // 插话失败静默,不打扰群
@@ -1125,7 +1163,8 @@ impl ChatCore {
                         ts: trace::now_ts(),
                         text: format!("插话失败: {e}"),
                     },
-                );
+                )
+                .await;
             }
         }
     }
@@ -1213,9 +1252,12 @@ impl ChatCore {
         let reply: String = match text {
             "/clear" => {
                 session.clear();
+                // 关键修复:清空上下文必须同时清空群聊轨迹,否则未触发消息
+                // (如发过的令牌)仍会通过轨迹注入,导致「/clear 之后机器人还记得」
+                self.trail.lock().unwrap().remove(&session.key);
                 self.emit_session(&session.key, session).await;
-                self.log("info", &format!("[{}] 已清空上下文", session.key));
-                "🧹 上下文已清空,重新开始对话。".to_string()
+                self.log("info", &format!("[{}] 已清空上下文与群聊轨迹", session.key));
+                "🧹 上下文与群聊轨迹已清空,重新开始对话。".to_string()
             }
             "/stats" => {
                 let toks = session.total_tokens();
@@ -1411,8 +1453,10 @@ impl ChatCore {
             )
         };
         let (prompt_tok, user_tok) = {
-            // 固定前缀 token:人设 + 记忆说明(恒定) + 当前提问
-            let pt = (estimate_tokens(&prompt, ratio) + estimate_tokens(MEMORY_GUIDE, ratio)) as u64;
+            // 固定前缀 token:人设 + 记忆说明 + 思考约束(恒定) + 当前提问
+            let pt = (estimate_tokens(&prompt, ratio)
+                + estimate_tokens(MEMORY_GUIDE, ratio)
+                + estimate_tokens(THINKING_GUIDE, ratio)) as u64;
             (pt, estimate_tokens(user_text, ratio) as u64)
         };
         // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
@@ -1522,7 +1566,8 @@ impl ChatCore {
                             folded: dropped.len(),
                             summary_tokens: session.summary_tokens,
                         },
-                    );
+                    )
+                    .await;
                     self.log(
                         "info",
                         &format!(
@@ -1647,11 +1692,12 @@ impl ChatCore {
     async fn emit_session(&self, key: &str, session: &Session) {
         let _ = self
             .events
-            .try_send(FrontendEvent::SessionChanged {
+            .send(FrontendEvent::SessionChanged {
                 key: key.to_string(),
                 count: session.history.len(),
                 tokens: session.total_tokens(),
-            });
+            })
+            .await;
     }
 
     // ---------- 活跃度与插话 ----------
@@ -1714,16 +1760,21 @@ impl ChatCore {
         }
     }
 
-    /// 插话采样:开关 + 冷却 + 概率(基线/钩子词/水消息 + 活跃度缩放)
+    /// 插话采样:开关 + 冷却 + 概率(基线/钩子词/水消息 + 活跃度缩放)或固定频率
     async fn interject_sample(&self, key: &str, text: &str) -> bool {
         let cfg = self.cfg.read().await;
         let ij = &cfg.chat.interject;
         if !ij.enabled || ij.mode == "off" {
             return false;
         }
-        // 冷却:距上次主动发言以来,群里新消息达到 cooldown_messages 条才允许插话
+        // 冷却:距上次主动发言以来,群里新消息达到阈值才允许插话。
+        // fixed_rate 模式阈值 = rate_every_messages(默认每 5 条);其余模式 = cooldown_messages。
         let count = self.msg_count.lock().unwrap().get(key).copied().unwrap_or(0);
-        let need = ij.cooldown_messages.max(1) as u64;
+        let need = if ij.mode == "fixed_rate" {
+            ij.rate_every_messages.max(1) as u64
+        } else {
+            ij.cooldown_messages.max(1) as u64
+        };
         if let Some(last) = self.interject_at.lock().unwrap().get(key) {
             let since = count.saturating_sub(*last);
             if since < need {
@@ -1733,6 +1784,12 @@ impl ChatCore {
                 );
                 return false;
             }
+        }
+        // 固定频率:冷却期满即插话,不做概率采样(是否开口交给决策器)
+        if ij.mode == "fixed_rate" {
+            self.log("debug", &format!("[{key}] 插话: 固定频率命中(每 {need} 条)"));
+            self.mark_interjected(key);
+            return true;
         }
         let factor = trigger::activity_factor(self.activity_rate(key, ij.activity_window_minutes.max(1)));
         let p = trigger::interject_probability(&cfg, text, factor);
@@ -1961,10 +2018,20 @@ pub async fn delete_history_msg(&self, key: &str, id: &str) -> Result<(), String
         if let Ok(mut s) = locked {
             s.ensure_loaded();
             s.clear();
-            self.log("info", &format!("[{key}] 已清空上下文"));
+            // 与 /clear 一致:群聊轨迹一并清空,避免清空后仍注入旧消息
+            self.trail.lock().unwrap().remove(key);
+            self.log("info", &format!("[{key}] 已清空上下文与群聊轨迹"));
         } else {
             self.log("warn", &format!("[{key}] 会话正在回复中,暂无法清空"));
         }
+    }
+
+    /// 清空会话历史轨迹(详情页时间线;上下文历史不动)
+    pub fn clear_trace(&self, key: &str) -> Result<(), String> {
+        let path = self.trace_dir.join(format!("{key}.jsonl"));
+        let _ = std::fs::remove_file(&path);
+        self.log("info", &format!("[{key}] 已清空历史轨迹(时间线)"));
+        Ok(())
     }
 }
 

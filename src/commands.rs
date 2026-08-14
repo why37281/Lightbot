@@ -366,6 +366,19 @@ pub async fn clear_session(state: tauri::State<'_, AppState>, key: String) -> Re
     }
 }
 
+/// 清空会话的历史轨迹(详情页时间线),上下文历史不动
+#[tauri::command]
+pub async fn clear_trace(state: tauri::State<'_, AppState>, key: String) -> Result<(), String> {
+    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(c) = chat {
+        return c.clear_trace(&key);
+    }
+    // 机器人未运行:直接删文件
+    let path = state.sessions_dir.join("traces").join(format!("{key}.jsonl"));
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// 会话详情:轨迹时间线 + 摘要信息(机器人未运行时直接读盘)
 #[tauri::command]
 pub async fn get_session_detail(

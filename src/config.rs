@@ -325,11 +325,16 @@ impl Default for TrailConfig {
 pub struct InterjectConfig {
     /// 总开关
     pub enabled: bool,
-    /// 模式: "adaptive" 按群活跃度自适应 / "fixed" 固定概率
+    /// 模式: "adaptive" 按群活跃度自适应 / "fixed" 固定概率 / "fixed_rate" 固定频率(每 N 条一次)
     pub mode: String,
     /// 插话冷却:距上次主动发言以来,群里新消息达到该条数才允许再次插话
     /// (比固定时间更符合群聊节奏:活跃群攒得快,冷清群自然少插话)
     pub cooldown_messages: u32,
+    /// 固定频率模式:每 N 条群消息插话一次(默认 5;仅 mode == "fixed_rate" 生效)
+    pub rate_every_messages: u32,
+    /// 完整上下文插话:开启后插话走完整通道(与普通回复一致——历史/记忆/轨迹按设置注入,
+    /// 并记入历史);关闭则走轻量通道(单轮、不落盘、不占会话上下文)
+    pub full_context: bool,
     /// 基线概率(0.0~1.0),命中钩子词加分、纯水消息减分
     pub base_probability: f64,
     /// 插话输出上限 tokens(轻量通道,保持低成本)
@@ -350,6 +355,8 @@ impl Default for InterjectConfig {
             enabled: true,
             mode: "adaptive".into(),
             cooldown_messages: 25,
+            rate_every_messages: 5,
+            full_context: false,
             base_probability: 0.05,
             interject_max_tokens: 120,
             activity_window_minutes: 2,

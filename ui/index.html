@@ -302,10 +302,17 @@
           <select id="cfg-interject-mode">
             <option value="adaptive">自适应(按群活跃度)</option>
             <option value="fixed">固定概率</option>
+            <option value="fixed_rate">固定频率(每 N 条一次)</option>
           </select>
         </label>
         <label>插话冷却(距上次发言的消息条数)
           <input id="cfg-interject-cooldown" type="number" min="1" max="1000" />
+        </label>
+        <label id="lbl-interject-rate">固定频率:每 N 条群消息插话一次
+          <input id="cfg-interject-rate" type="number" min="1" max="200" />
+        </label>
+        <label class="check">插话使用完整上下文(与普通回复一致:历史/记忆/轨迹按设置注入并记入历史)
+          <input id="cfg-interject-fullctx" type="checkbox" />
         </label>
         <label>基线概率(%)
           <input id="cfg-interject-prob" type="number" min="0" max="60" step="1" />
@@ -327,7 +334,7 @@
         </label>
       </div>
       <div class="tips">
-        <p>💡 插话走轻量通道:单轮、不占会话上下文、不落盘、不新开会话;概率 = 基线 + 钩子词加分 − 纯水减分,再按群活跃度缩放(刷屏 ×0.3,冷清 ×2)。软 at 走完整通道(记入历史),两者共用冷却。</p>
+        <p>💡 插话默认走轻量通道:单轮、不占会话上下文、不落盘、不新开会话;概率 = 基线 + 钩子词加分 − 纯水减分,再按群活跃度缩放(刷屏 ×0.3,冷清 ×2)。「固定频率」模式不做概率采样,冷却期满(默认每 5 条)即触发。开启「完整上下文」后插话改为完整通道(与普通回复一致)。软 at 走完整通道(记入历史),共用冷却;决策器开启时所有插话都会先过决策器。</p>
       </div>
       <h3 style="display:flex;align-items:center;gap:10px">会话列表 <button id="btn-refresh-sessions" class="btn small">刷新</button></h3>
       <table id="session-table">

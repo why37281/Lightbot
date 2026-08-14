@@ -119,7 +119,13 @@ function handleEvent(ev) {
       scheduleCostRefresh();
       break;
     }
-    case "session_changed": refreshSessions(); break;
+    case "session_changed":
+      refreshSessions();
+      // 详情页打开时同步条数/tokens
+      if (detailState.key === ev.key) {
+        $("#detail-meta").textContent = `${ev.count} 条消息 · 约 ${(ev.tokens || 0).toLocaleString()} tokens`;
+      }
+      break;
     case "status": updateStatusView(ev.status); break;
     case "session_status": {
       updateSessionStatusCell(ev.key, ev.status);
@@ -206,6 +212,8 @@ function bindConfigToForm() {
   $("#cfg-interject").checked = ij.enabled;
   $("#cfg-interject-mode").value = ij.mode;
   $("#cfg-interject-cooldown").value = ij.cooldown_messages;
+  $("#cfg-interject-rate").value = ij.rate_every_messages;
+  $("#cfg-interject-fullctx").checked = !!ij.full_context;
   $("#cfg-interject-prob").value = Math.round(ij.base_probability * 100);
   $("#cfg-interject-maxtok").value = ij.interject_max_tokens;
   $("#cfg-interject-window").value = ij.activity_window_minutes;
@@ -228,6 +236,7 @@ function bindConfigToForm() {
   $("#cfg-trail-tokens").value = c.trail.max_tokens;
   syncModeFields();
   syncTrailModeFields();
+  syncInterjectFields();
 }
 
 function collectForm() {
@@ -260,6 +269,8 @@ function collectForm() {
   ij.enabled = $("#cfg-interject").checked;
   ij.mode = $("#cfg-interject-mode").value;
   ij.cooldown_messages = parseInt($("#cfg-interject-cooldown").value) || 25;
+  ij.rate_every_messages = parseInt($("#cfg-interject-rate").value) || 5;
+  ij.full_context = $("#cfg-interject-fullctx").checked;
   ij.base_probability = (parseFloat($("#cfg-interject-prob").value) || 5) / 100;
   ij.interject_max_tokens = parseInt($("#cfg-interject-maxtok").value) || 120;
   ij.activity_window_minutes = parseInt($("#cfg-interject-window").value) || 2;
@@ -299,6 +310,13 @@ function syncTrailModeFields() {
   $("#cfg-trail-window").closest("label").classList.toggle("disabled-field", !windowMode);
 }
 $("#cfg-trail-mode").addEventListener("change", syncTrailModeFields);
+
+// 插话模式:固定频率模式显示「每 N 条」设置
+function syncInterjectFields() {
+  const fixedRate = $("#cfg-interject-mode").value === "fixed_rate";
+  $("#lbl-interject-rate").style.display = fixedRate ? "" : "none";
+}
+$("#cfg-interject-mode").addEventListener("change", syncInterjectFields);
 
 // ---------- 保存 ----------
 $("#btn-save").addEventListener("click", async () => {
@@ -592,9 +610,17 @@ async function refreshSessions() {
       <td>${s.count}</td>
       <td>${s.tokens}</td>
       <td>${s.has_summary ? "✓" : "-"}</td>
-      <td><button class="btn small danger clear-session">清空</button></td>`;
+      <td class="row-actions">
+        <button class="btn small danger clear-session">清空</button>
+        <span class="menu-wrap">
+          <button class="btn small row-more" title="更多操作">⋯</button>
+          <span class="row-menu hidden">
+            <button class="row-menu-item clear-trace">清空历史(轨迹)</button>
+          </span>
+        </span>
+      </td>`;
     tr.querySelector(".status-cell").appendChild(statusCapsule(s.status || "idle"));
-    // 整行可点开详情页;清空按钮单独处理(不冒泡)
+    // 整行可点开详情页;按钮单独处理(不冒泡)
     tr.addEventListener("click", () => openSessionDetail(s.key));
     tr.querySelector(".clear-session").addEventListener("click", async (e) => {
       e.stopPropagation();
@@ -604,9 +630,32 @@ async function refreshSessions() {
         refreshSessions();
       } catch (err) { addLog("error", "清空失败: " + err); }
     });
+    // ⋯ 下拉菜单
+    const moreBtn = tr.querySelector(".row-more");
+    const menu = tr.querySelector(".row-menu");
+    moreBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      $$(".row-menu").forEach((m) => { if (m !== menu) m.classList.add("hidden"); });
+      menu.classList.toggle("hidden");
+    });
+    tr.querySelector(".clear-trace").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      menu.classList.add("hidden");
+      if (!confirm(`确认清空会话 ${s.key} 的历史轨迹(详情页时间线)?上下文不受影响。`)) return;
+      try {
+        await invoke("clear_trace", { key: s.key });
+        addLog("info", `已清空 ${s.key} 的历史轨迹`);
+        if (detailState.key === s.key) openSessionDetail(s.key);
+      } catch (err) { addLog("error", "清空轨迹失败: " + err); }
+    });
     tbody.appendChild(tr);
   }
 }
+
+// 点击任意位置关闭 ⋯ 菜单
+document.addEventListener("click", () => {
+  $$(".row-menu").forEach((m) => m.classList.add("hidden"));
+});
 
 // ---------- 5c. 记忆管理 ----------
 async function renderMemories() {
@@ -988,10 +1037,44 @@ $("#btn-detail-stop").addEventListener("click", async () => {
   } catch (e) { alert("停止失败: " + e); }
 });
 
-// 直播:完整轨迹事件(新 turn 开始 / 决策 / 最终输出 / 错误)
+// 直播:完整轨迹事件(新 turn 开始 / 决策 / 最终输出 / 错误)。
+// msg_out / think 为「收尾事件」:更新直播中创建的卡片为最终全量文本,不再追加新卡片。
 function handleTraceEvent(ev) {
   if (!detailState.key || ev.key !== detailState.key) return;
-  renderDetailEntry(ev.entry);
+  const entry = ev.entry;
+  if (entry.type === "msg_out") {
+    const block = detailState.turnBlocks.get(entry.turn);
+    if (block && block.outCard) {
+      const { card, body } = block.outCard;
+      block.outCard = null;
+      const u = entry.usage || {};
+      const ratio = u.cache_hit + u.cache_miss > 0 ? Math.round((u.cache_hit / (u.cache_hit + u.cache_miss)) * 100) : 0;
+      card.querySelector(".tl-title").textContent =
+        `🤖 AI 回复 · ${escapeHtml(entry.model)} · ${fmtTime(entry.ts)}`;
+      body.textContent = entry.text;
+      const foot = document.createElement("div");
+      foot.className = "tl-foot";
+      foot.textContent = `prompt ${(u.prompt_tokens || 0).toLocaleString()}t · 命中 ${(u.cache_hit || 0).toLocaleString()}t(${ratio}%) · 输出 ${(u.completion_tokens || 0).toLocaleString()}t${u.reasoning_tokens ? ` · 思考 ${u.reasoning_tokens.toLocaleString()}t` : ""}`;
+      card.appendChild(foot);
+      bindDetailActions();
+      return;
+    }
+    renderDetailEntry(entry);
+    bindDetailActions();
+    return;
+  }
+  if (entry.type === "think") {
+    const block = detailState.turnBlocks.get(entry.turn);
+    if (block && block.thinkCard) {
+      const { card, body } = block.thinkCard;
+      block.thinkCard = null;
+      card.querySelector(".tl-title").textContent =
+        `💭 思考过程 · ${(entry.tokens || 0).toLocaleString()} tokens · ${fmtTime(entry.ts)}`;
+      body.textContent = entry.text;
+      return;
+    }
+  }
+  renderDetailEntry(entry);
   bindDetailActions();
 }
 
