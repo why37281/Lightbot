@@ -20,7 +20,7 @@
 //! 1. 每 EVAL_EVERY 轮评估一次;
 //! 2. 只有「相对节省 ≥ MIN_REL_SAVING」且「展望 HORIZON 轮的净收益 > 一次切换成本」才算值得切;
 //! 3. 同一方向连续 STREAK_NEEDED 次评估成立才发出提案;
-//! 4. 切换/拒绝后进入 SWITCH_COOLDOWN_SECS 冷却,冷却期内不再评估。
+//! 4. 切换/拒绝后进入冷却(时长可配置 `auto_cooldown_minutes`,默认 120 分钟),冷却期内不再评估。
 //!
 //! 提案只作「建议」:发出醒目弹窗,用户批准后由命令层真正落盘切换。
 
@@ -34,8 +34,6 @@ pub const STREAK_NEEDED: u32 = 4;
 pub const HORIZON: u64 = 120;
 /// 相对节省门槛:低于此比例的边际收益不值得触发切换
 pub const MIN_REL_SAVING: f64 = 0.15;
-/// 切换/拒绝后的冷却时长(秒)
-pub const SWITCH_COOLDOWN_SECS: i64 = 24 * 3600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,7 +224,7 @@ impl PlacementController {
         self.growth = self.growth * 0.8 + growth_tokens.max(0.0) * 0.2;
     }
 
-    /// 到达评估点时调用;返回提案(仅当连续同向且不在冷却期)
+    /// 到达评估点时调用(now 为 epoch 秒);返回提案(仅当连续同向且不在冷却期)
     pub fn evaluate(&mut self, e: &Eval, current: Scheme, now: i64) -> Option<Proposal> {
         if now < self.cooldown_until || self.pending.is_some() {
             return None;
@@ -300,10 +298,10 @@ impl PlacementController {
         Some(proposal)
     }
 
-    /// 批准或拒绝后调用:清提案 + 冷却
-    pub fn settle(&mut self, now: i64) {
+    /// 批准或拒绝后调用:清提案 + 进入冷却(cooldown_secs 取自配置,默认 2 小时)
+    pub fn settle(&mut self, now: i64, cooldown_secs: i64) {
         self.pending = None;
-        self.cooldown_until = now + SWITCH_COOLDOWN_SECS;
+        self.cooldown_until = now + cooldown_secs.max(0);
         self.streak = 0;
         self.rounds_in_window = 0;
         self.changed_in_window = 0;
@@ -397,7 +395,7 @@ mod tests {
 
         // 未 settle 前不再重复提案;settle 后进入冷却,冷却期内不评估
         assert!(ctl.evaluate(&e, Scheme::One, now).is_none());
-        ctl.settle(now);
+        ctl.settle(now, 24 * 3600);
         assert!(ctl.pending.is_none());
         for _ in 0..STREAK_NEEDED {
             ctl.feed_round(false, 300.0);
@@ -410,5 +408,10 @@ mod tests {
             ctl.evaluate(&e, Scheme::One, now);
         }
         assert!(ctl.pending.is_some());
+
+        // 冷却时长参数化:settle 传入的秒数决定截止时间
+        let mut ctl2 = PlacementController::default();
+        ctl2.settle(now, 7200); // 2 小时
+        assert_eq!(ctl2.cooldown_until, now + 7200);
     }
 }

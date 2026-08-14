@@ -35,6 +35,7 @@ pub fn run() {
             commands::add_memory,
             commands::delete_memory,
             commands::get_cost_overview,
+            commands::query_balance,
             commands::get_placement_proposal,
             commands::approve_placement,
         ])

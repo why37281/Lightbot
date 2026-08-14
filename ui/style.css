@@ -129,6 +129,7 @@ input[type="text"], input[type="number"], input[type="password"], select, textar
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
 textarea { resize: vertical; min-height: 90px; font-family: Consolas, "Microsoft YaHei", monospace; line-height: 1.5; }
+label.disabled-field { opacity: .5; }
 
 /* 按钮 */
 .btn {

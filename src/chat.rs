@@ -579,19 +579,23 @@ impl ChatCore {
         }
     }
 
-    /// 记录群聊轨迹(仅群聊;窗口与条数取自配置)
+    /// 记录群聊轨迹(仅群聊;窗口与条数按注入模式取配置)。
+    /// window 模式按 window_minutes 保留;all / triggered_only 保留 24 小时
+    /// (触发时才有更多上下文可注入),条数上限始终生效。
     async fn record_trail(&self, key: &str, text: &str) {
         if !key.starts_with('g') {
             return;
         }
-        let (win, max) = {
+        let (win, max, mode) = {
             let cfg = self.cfg.read().await;
             (
                 cfg.chat.trail.window_minutes.max(1) * 60,
                 cfg.chat.trail.max_entries as usize,
+                cfg.chat.trail.inject_mode.clone(),
             )
         };
-        self.trail_push(key, text, win, max);
+        let window_secs = if mode == "window" { win } else { 86400 };
+        self.trail_push(key, text, window_secs, max);
     }
 
     /// 决策器:开启时由当前模型判断这条消息是否需要回复。
@@ -1005,25 +1009,40 @@ impl ChatCore {
                 msgs.push(m);
             }
         }
-        // 群聊轨迹:最近未触发消息(位于最后,变化不影响历史/记忆缓存)
+        // 群聊轨迹:最近未触发消息(位于最后,变化不影响历史/记忆缓存)。
+        // 注入行为三档:
+        //  window          所有完整对话都注入,按时间窗口过滤(默认);
+        //  all             所有完整对话都注入,不受时间窗口限制(缓冲保留 24h);
+        //  triggered_only  仅 @ / 引用触发的对话注入。
         if trail_cfg.enabled && msg.kind == MsgKind::Group {
-            let lines = self
-                .trail
-                .lock()
-                .unwrap()
-                .get(key)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(content) = render_trail(
-                &lines,
-                trail_cfg.window_minutes.max(1) * 60,
-                trail_cfg.max_tokens,
-                ratio,
-            ) {
-                msgs.push(ApiMessage {
-                    role: "user".into(),
-                    content,
-                });
+            let inject = match trail_cfg.inject_mode.as_str() {
+                "triggered_only" => msg.at_me || msg.reply_me,
+                _ => true,
+            };
+            if inject {
+                let lines = self
+                    .trail
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_default();
+                let window_secs = if trail_cfg.inject_mode == "window" {
+                    trail_cfg.window_minutes.max(1) * 60
+                } else {
+                    86400
+                };
+                if let Some(content) = render_trail(
+                    &lines,
+                    window_secs,
+                    trail_cfg.max_tokens,
+                    ratio,
+                ) {
+                    msgs.push(ApiMessage {
+                        role: "user".into(),
+                        content,
+                    });
+                }
             }
         }
         msgs.push(ApiMessage {

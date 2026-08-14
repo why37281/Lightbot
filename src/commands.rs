@@ -524,6 +524,46 @@ pub async fn delete_memory(
 
 // ---------- 开销面板 ----------
 
+/// 查询 DeepSeek 账户余额(GET /user/balance,使用当前激活模型的 key)。
+/// 返回 {model, is_available, balances:[{currency, total, granted, topped_up}]}
+#[tauri::command]
+pub async fn query_balance(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let model = state
+        .config
+        .read()
+        .await
+        .active_model()
+        .cloned()
+        .ok_or("未配置可用模型".to_string())?;
+    let v = LlmClient::new().balance(&model).await?;
+    let mut balances = Vec::new();
+    for b in v
+        .get("balance_infos")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let cur = b.get("currency").and_then(|x| x.as_str()).unwrap_or("");
+        let num = |k: &str| -> f64 {
+            b.get(k)
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0)
+        };
+        balances.push(serde_json::json!({
+            "currency": cur,
+            "total": num("total_balance"),
+            "granted": num("granted_balance"),
+            "topped_up": num("topped_up_balance"),
+        }));
+    }
+    Ok(serde_json::json!({
+        "model": model.name,
+        "is_available": v.get("is_available").and_then(|x| x.as_bool()).unwrap_or(false),
+        "balances": balances,
+    }))
+}
+
 /// 开销面板数据:今日聚合 + 分类条形图 + 钱包
 #[tauri::command]
 pub async fn get_cost_overview(state: tauri::State<'_, AppState>) -> Result<Value, String> {
@@ -560,7 +600,13 @@ pub async fn approve_placement(
     approve: bool,
 ) -> Result<Option<String>, String> {
     // 提案仍与当前方案不同才应用(用户可能已手动改过);锁守卫不可跨 await,先取当前值
-    let current = state.config.read().await.chat.memory.placement.clone();
+    let (current, cooldown_secs) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.chat.memory.placement.clone(),
+            (cfg.chat.memory.auto_cooldown_minutes.max(1) * 60) as i64,
+        )
+    };
     let applied = {
         let mut ctl = state.placement.lock().map_err(|e| e.to_string())?;
         let now = crate::trace::now_ts();
@@ -572,7 +618,7 @@ pub async fn approve_placement(
         } else {
             None
         };
-        ctl.settle(now);
+        ctl.settle(now, cooldown_secs);
         applied
     };
     if let Some(to) = applied {

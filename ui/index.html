@@ -213,18 +213,25 @@
         <label class="check">启用群聊轨迹(未 @ 的消息也进上下文)
           <input id="cfg-trail" type="checkbox" />
         </label>
-        <label>轨迹窗口(分钟)
+        <label>上下文注入行为
+          <select id="cfg-trail-mode">
+            <option value="window">窗口注入(默认):所有对话都注入,按下方参数过滤</option>
+            <option value="all">全部注入:无论有没有 @/引用都注入,不受时间窗口限制</option>
+            <option value="triggered_only">不额外注入:仅 @/引用机器人时才注入</option>
+          </select>
+        </label>
+        <label>轨迹窗口(分钟,窗口注入时生效)
           <input id="cfg-trail-window" type="number" min="1" max="60" />
         </label>
-        <label>最多条数
+        <label>最多条数(各模式下的安全上限)
           <input id="cfg-trail-max" type="number" min="1" max="50" />
         </label>
-        <label>轨迹 token 上限
+        <label>轨迹 token 上限(各模式下的注入上限)
           <input id="cfg-trail-tokens" type="number" min="64" max="4000" />
         </label>
       </div>
       <div class="tips">
-        <p>💡 群聊轨迹:未 @ / 未提及的普通消息会被短暂记录,触发对话时拼在提问前——机器人记得"群里刚说了什么",不再有"鱼的记忆"。位于消息流末尾,不影响历史与记忆的缓存命中。</p>
+        <p>💡 群聊轨迹:未 @ / 未提及的普通消息会被短暂记录,触发对话时拼在提问前——机器人记得"群里刚说了什么",不再有"鱼的记忆"。位于消息流末尾,不影响历史与记忆的缓存命中。非「窗口注入」模式下,时间窗口不生效(缓冲保留 24 小时),最多条数与 token 上限仍作为安全上限。</p>
       </div>
       <h3>长期记忆</h3>
       <div class="form-grid narrow">
@@ -239,6 +246,9 @@
         </label>
         <label class="check">自动控制(按成本模型推荐方案,切换需弹窗审批)
           <input id="cfg-mem-auto" type="checkbox" />
+        </label>
+        <label>切换/拒绝后冷却时长(小时)
+          <input id="cfg-mem-cooldown" type="number" min="0.1" max="720" step="0.1" />
         </label>
         <label>方案二:新历史折叠阈值(token)
           <input id="cfg-recent-tokens" type="number" min="200" max="65536" />
@@ -262,7 +272,7 @@
       <div id="memory-list"></div>
       <div class="tips">
         <p>💡 两方案的区别与适用场景(详见 README「记忆位置策略」):<b>方案一</b>记忆在历史之后——历史每轮增长,记忆每轮都吃未命中价,适合记忆少、变化频繁;<b>方案二</b>记忆在摘要之后、新历史之前——记忆稳定吃命中价(约 1/50 价格),但记忆变更/折叠摘要时断一次缓存,适合记忆多、变化少。新历史超过阈值时把超出「保留条数」的部分摘要进旧历史。</p>
-        <p>💡 开启「自动控制」后,程序按真实价格与实测指标(记忆大小/变更频率/每轮增长)持续评估,连续多轮结论一致且净收益大于切换成本时,弹出醒目审批窗,你批准后才切换;切换后有 24 小时冷却,不会在分界线附近反复横跳。</p>
+        <p>💡 开启「自动控制」后,程序按真实价格与实测指标(记忆大小/变更频率/每轮增长)持续评估,连续多轮结论一致且净收益大于切换成本时,弹出醒目审批窗,你批准后才切换;切换后进入冷却(时长在上方设置,默认 2 小时),不会在分界线附近反复横跳。</p>
         <p>💡 模型通过回复末尾 <code>[记忆:添加 xxx]</code> 标记自动写入;QQ 里可用 <code>/remember</code> <code>/forget</code> <code>/memories</code> 管理。</p>
       </div>
       <h3>消息忽略与费用预算</h3>
@@ -274,8 +284,13 @@
           <input id="cfg-wallet" type="number" step="0.01" min="0" />
         </label>
       </div>
+      <div class="actions">
+        <button id="btn-query-balance" class="btn small">查询 DeepSeek 余额(用当前模型 key)</button>
+        <span id="balance-result" class="result"></span>
+      </div>
       <div class="tips">
         <p>💡 * 前缀消息完全绕过模型(不回复、不触发、不占上下文),只在日志与会话详情里留痕——群友可以自由用 <code>*xxx</code> 闲聊而不会被机器人接话。</p>
+        <p>💡 「查询余额」调用 DeepSeek 官方 <code>GET /user/balance</code>,成功后自动把总余额填入上方钱包余额(需点「保存配置」才会落盘)。</p>
         <p>💡 每个模型的输入(命中/未命中)与输出单价在「模型设置」的模型卡片里填写(元 / 百万 tokens)。DeepSeek 近期多次调价,请以官方定价页为准:https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ 。内置默认:V4-Flash 0.02 / 1 / 2,V4-Pro 0.025 / 3 / 6。</p>
       </div>
       <h3>主动插话(活人感)</h3>

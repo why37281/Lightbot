@@ -205,6 +205,31 @@ impl LlmClient {
         })
     }
 
+    /// 查询账户余额(DeepSeek `GET /user/balance`,Bearer 认证)。
+    /// 返回原始 JSON(`is_available` + `balance_infos`);非 DeepSeek 服务商无此接口会报错。
+    pub async fn balance(&self, m: &ModelConfig) -> Result<Value, String> {
+        let url = format!("{}/user/balance", m.base_url.trim_end_matches('/'));
+        let timeout = Duration::from_secs(m.timeout_secs.max(10));
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(timeout)
+            .bearer_auth(m.api_key.trim())
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("余额查询失败: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取响应失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {}", truncate(&text, 200)));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("响应解析失败: {e}"))
+    }
+
     /// 连通性测试:发一条最小请求(关闭思考模式,快速返回)
     pub async fn ping(&self, m: &ModelConfig) -> Result<String, String> {
         let msgs = vec![ApiMessage {
@@ -224,6 +249,7 @@ impl LlmClient {
 
     /// 用当前模型把一批旧消息压缩成摘要(缓存友好折叠,非思考模式)。
     /// 返回(摘要文本, usage) —— usage 供费用追踪。
+    /// 摘要必须保留「谁说的」:历史消息的 AI/用户归属在折叠后仍然可辨。
     pub async fn summarize(
         &self,
         m: &ModelConfig,
@@ -231,7 +257,7 @@ impl LlmClient {
         dropped: &[ApiMessage],
         max_tokens: u32,
     ) -> Result<(String, Usage), String> {
-        let mut content = String::from("请把下面的对话历史压缩成简洁的要点摘要,保留:关键事实、用户的偏好与要求、尚未完成的事项、对话主题。只输出摘要本身。\n\n");
+        let mut content = String::from("请把下面的对话历史压缩成简洁的要点摘要,保留:关键事实、用户的偏好与要求、尚未完成的事项、对话主题。\n每条要点必须注明是谁说的:用户说的标「用户:」,AI 说的标「AI:」。\n只输出摘要本身。\n\n");
         if !old_summary.is_empty() {
             content.push_str("【已有摘要】\n");
             content.push_str(old_summary);

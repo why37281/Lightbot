@@ -215,16 +215,19 @@ function bindConfigToForm() {
   $("#cfg-memory").checked = mem.enabled;
   $("#cfg-mem-placement").value = mem.placement;
   $("#cfg-mem-auto").checked = mem.auto_placement;
+  $("#cfg-mem-cooldown").value = (mem.auto_cooldown_minutes / 60);
   $("#cfg-recent-tokens").value = c.recent_max_tokens;
   $("#cfg-recent-keep").value = c.recent_keep_msgs;
   $("#cfg-mem-max").value = mem.max_entries;
   $("#cfg-mem-chars").value = mem.max_entry_chars;
   $("#cfg-mem-tokens").value = mem.max_tokens;
   $("#cfg-trail").checked = c.trail.enabled;
+  $("#cfg-trail-mode").value = c.trail.inject_mode || "window";
   $("#cfg-trail-window").value = c.trail.window_minutes;
   $("#cfg-trail-max").value = c.trail.max_entries;
   $("#cfg-trail-tokens").value = c.trail.max_tokens;
   syncModeFields();
+  syncTrailModeFields();
 }
 
 function collectForm() {
@@ -266,12 +269,14 @@ function collectForm() {
   mem.enabled = $("#cfg-memory").checked;
   mem.placement = $("#cfg-mem-placement").value;
   mem.auto_placement = $("#cfg-mem-auto").checked;
+  mem.auto_cooldown_minutes = Math.round((parseFloat($("#cfg-mem-cooldown").value) || 2) * 60);
   c.recent_max_tokens = parseInt($("#cfg-recent-tokens").value) || 3000;
   c.recent_keep_msgs = parseInt($("#cfg-recent-keep").value) || 10;
   mem.max_entries = parseInt($("#cfg-mem-max").value) || 30;
   mem.max_entry_chars = parseInt($("#cfg-mem-chars").value) || 200;
   mem.max_tokens = parseInt($("#cfg-mem-tokens").value) || 1200;
   c.trail.enabled = $("#cfg-trail").checked;
+  c.trail.inject_mode = $("#cfg-trail-mode").value;
   c.trail.window_minutes = parseInt($("#cfg-trail-window").value) || 5;
   c.trail.max_entries = parseInt($("#cfg-trail-max").value) || 10;
   c.trail.max_tokens = parseInt($("#cfg-trail-tokens").value) || 800;
@@ -286,6 +291,14 @@ function syncModeFields() {
   $("#lbl-reverse-port").style.display = reverse ? "" : "none";
 }
 $("#cfg-mode").addEventListener("change", syncModeFields);
+
+// 轨迹注入:只有「窗口注入」激活时间窗口设置(条数与 token 上限作为安全上限仍显示)
+function syncTrailModeFields() {
+  const windowMode = $("#cfg-trail-mode").value === "window";
+  $("#cfg-trail-window").disabled = !windowMode;
+  $("#cfg-trail-window").closest("label").classList.toggle("disabled-field", !windowMode);
+}
+$("#cfg-trail-mode").addEventListener("change", syncTrailModeFields);
 
 // ---------- 保存 ----------
 $("#btn-save").addEventListener("click", async () => {
@@ -705,6 +718,39 @@ async function refreshCost() {
 
 $("#btn-refresh-cost").addEventListener("click", refreshCost);
 
+// 查询 DeepSeek 账户余额(当前激活模型 key)
+$("#btn-query-balance").addEventListener("click", async () => {
+  const btn = $("#btn-query-balance");
+  const res = $("#balance-result");
+  btn.disabled = true;
+  res.textContent = "查询中…";
+  res.className = "result";
+  try {
+    const d = await invoke("query_balance");
+    const b = (d.balances || [])[0];
+    if (!b) {
+      res.textContent = "未返回余额信息";
+      res.className = "result err";
+    } else {
+      const state = d.is_available ? "" : " · 当前不可用";
+      res.textContent =
+        `✓ ${d.model}: 总余额 ¥${b.total.toFixed(2)}` +
+        `(充值 ¥${b.topped_up.toFixed(2)} + 赠送 ¥${b.granted.toFixed(2)})${state}`;
+      res.className = "result ok";
+      // 自动填入钱包余额(点「保存配置」落盘)
+      cfg.cost.wallet_balance = b.total;
+      $("#cfg-wallet").value = b.total.toFixed(2);
+      refreshCost();
+      addLog("info", `余额查询: ${d.model} 总余额 ¥${b.total.toFixed(2)}`);
+    }
+  } catch (e) {
+    res.textContent = String(e);
+    res.className = "result err";
+    addLog("error", "余额查询失败: " + e);
+  }
+  btn.disabled = false;
+});
+
 // ---------- 7. 会话详情页 ----------
 const detailState = {
   key: null,
@@ -769,14 +815,14 @@ function renderDetailEntry(ev) {
     case "msg_in": {
       const triggerLabel = { at: "at 触发", reply: "引用回复", keyword: "关键词", private: "私聊", ignored: "★ 忽略", decided_no: "决策器拒绝" }[ev.trigger] || ev.trigger;
       const card = tlCard(ev.ignored ? "msg-ignored" : "msg-in",
-        `↓ 收到消息 · ${triggerLabel} · ${fmtTime(ev.ts)}`,
+        `👤 用户消息 · ${triggerLabel} · ${fmtTime(ev.ts)}`,
         editButtons(ev.id));
       tlBody(card, ev.text);
       appendTurnCard(ev.turn, card);
       break;
     }
     case "cmd": {
-      const card = tlCard("cmd", `⚙ 命令 · ${fmtTime(ev.ts)}`);
+      const card = tlCard("cmd", `⚙ 用户命令 · ${fmtTime(ev.ts)}`);
       tlBody(card, ev.text);
       const rep = document.createElement("div");
       rep.className = "tl-reply";
@@ -811,7 +857,7 @@ function renderDetailEntry(ev) {
       const u = ev.usage || {};
       const ratio = u.cache_hit + u.cache_miss > 0 ? Math.round((u.cache_hit / (u.cache_hit + u.cache_miss)) * 100) : 0;
       const card = tlCard("msg-out",
-        `→ 模型输出(回复) · ${escapeHtml(ev.model)} · ${fmtTime(ev.ts)}`,
+        `🤖 AI 回复 · ${escapeHtml(ev.model)} · ${fmtTime(ev.ts)}`,
         editButtons(ev.id));
       tlBody(card, ev.text);
       const foot = document.createElement("div");
@@ -822,7 +868,7 @@ function renderDetailEntry(ev) {
       break;
     }
     case "lite_out": {
-      const card = tlCard("lite-out", `💬 主动插话 · ${escapeHtml(ev.model)} · ${fmtTime(ev.ts)}`);
+      const card = tlCard("lite-out", `🤖 主动插话(AI) · ${escapeHtml(ev.model)} · ${fmtTime(ev.ts)}`);
       tlBody(card, ev.text);
       appendTurnCard(ev.turn, card);
       break;
@@ -966,7 +1012,7 @@ function handleTurnDelta(ev) {
     block.thinkCard.body.textContent += ev.text;
   } else if (ev.kind === "out") {
     if (!block.outCard) {
-      const card = tlCard("msg-out", "→ 模型输出(回复,进行中)");
+      const card = tlCard("msg-out", "🤖 AI 回复(进行中)");
       const body = tlBody(card, "");
       block.el.appendChild(card);
       block.outCard = { card, body };
@@ -979,6 +1025,8 @@ function handleTurnDelta(ev) {
 // ---------- 8. 记忆位置切换审批弹窗 ----------
 function showApprovalModal(p) {
   const name = { front: "方案二(摘要→记忆→新历史→提问)", back: "方案一(历史→记忆→提问)" };
+  const cdMin = (cfg?.chat?.memory?.auto_cooldown_minutes) || 120;
+  const cdText = cdMin >= 60 ? (cdMin / 60) + " 小时" : cdMin + " 分钟";
   const body = $("#approval-body");
   body.innerHTML = "";
   const info = document.createElement("div");
@@ -992,7 +1040,7 @@ function showApprovalModal(p) {
       <span>一次性切换成本 <b>¥${(p.switch_cost / 1e6).toFixed(4)}</b></span>
       <span>展望 ${p.horizon} 轮净省 <b>¥${(p.expected_saving / 1e6).toFixed(2)}</b></span>
     </div>
-    <p class="muted" style="font-size:12px">切换会立即重启机器人并导致一次大范围缓存未命中;批准后 24 小时内不再提出新的切换。</p>`;
+    <p class="muted" style="font-size:12px">切换会立即重启机器人并导致一次大范围缓存未命中;批准或拒绝后 ${escapeHtml(cdText)} 内不再提出新的切换(冷却时长可在会话设置调整)。</p>`;
   body.appendChild(info);
   $("#approval-modal").classList.remove("hidden");
 }
@@ -1024,7 +1072,9 @@ $("#btn-approve-no").addEventListener("click", async () => {
   $("#approval-modal").classList.add("hidden");
   try {
     await invoke("approve_placement", { approve: false });
-    addLog("info", "已拒绝切换提案,进入 24 小时冷却");
+    const cdMin = (cfg?.chat?.memory?.auto_cooldown_minutes) || 120;
+    const cdText = cdMin >= 60 ? (cdMin / 60) + " 小时" : cdMin + " 分钟";
+    addLog("info", `已拒绝切换提案,进入 ${cdText} 冷却`);
   } catch (e) { /* 忽略 */ }
 });
 

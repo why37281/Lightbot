@@ -266,6 +266,8 @@ pub struct MemoryConfig {
     /// 自动控制:开启后程序按成本模型持续评估两方案,需要切换时弹出醒目审批弹窗,
     /// 用户批准后才真正切换(带滞回与冷却,避免在分界线附近反复横跳)。
     pub auto_placement: bool,
+    /// 切换/拒绝提案后的冷却时长(分钟,默认 120 = 2 小时);冷却期内不再评估切换
+    pub auto_cooldown_minutes: u64,
 }
 
 impl Default for MemoryConfig {
@@ -277,6 +279,7 @@ impl Default for MemoryConfig {
             max_tokens: 1200,
             placement: "front".into(),
             auto_placement: true,
+            auto_cooldown_minutes: 120,
         }
     }
 }
@@ -289,11 +292,16 @@ impl Default for MemoryConfig {
 pub struct TrailConfig {
     /// 总开关
     pub enabled: bool,
-    /// 轨迹窗口(分钟),窗口外的消息过期
+    /// 上下文注入行为:
+    ///  "window"         窗口注入(默认,即现状):所有完整对话都注入,内容按下面三个参数过滤;
+    ///  "all"            全部注入:无论触发方式都注入,且不受时间窗口限制(缓冲保留 24h);
+    ///  "triggered_only" 不额外注入:仅当消息 @ 或引用机器人时才注入轨迹。
+    pub inject_mode: String,
+    /// 轨迹窗口(分钟),窗口外的消息过期(仅 window 模式生效)
     pub window_minutes: u64,
-    /// 最多保留条数(超出丢最旧)
+    /// 最多保留条数(超出丢最旧;非 window 模式仍作为缓冲安全上限)
     pub max_entries: u32,
-    /// 轨迹总 token 上限(超出丢最旧,保护成本)
+    /// 轨迹总 token 上限(超出丢最旧,保护成本;非 window 模式仍作为注入安全上限)
     pub max_tokens: u32,
 }
 
@@ -301,6 +309,7 @@ impl Default for TrailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            inject_mode: "window".into(),
             window_minutes: 5,
             max_entries: 10,
             max_tokens: 800,
