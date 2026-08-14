@@ -66,7 +66,24 @@
             <div class="kv"><span>累计未命中</span><b id="ov-miss">-</b></div>
             <div class="kv"><span>最近一次耗时</span><b id="ov-last-ms">-</b></div>
           </div>
-          <div class="card-note">命中缓存的部分计费约为正常的 1/10。保持人设与历史前缀稳定即可持续命中。</div>
+          <div class="card-note">命中缓存的部分计费约为正常的 1/50~1/120。保持人设与历史前缀稳定即可持续命中。</div>
+        </div>
+      </div>
+      <div class="card cost-panel">
+        <div class="card-title">今日开销
+          <button id="btn-refresh-cost" class="btn small">刷新</button>
+        </div>
+        <div class="cost-stats">
+          <div class="kv"><span>今日消耗 token</span><b id="cost-tokens">-</b></div>
+          <div class="kv"><span>缓存命中 / 未命中</span><b id="cost-hit-miss">-</b></div>
+          <div class="kv"><span>今日费用</span><b id="cost-yuan">-</b></div>
+          <div class="kv"><span>钱包剩余</span><b id="cost-wallet">-</b></div>
+        </div>
+        <div id="cost-bars" class="cost-bars"></div>
+        <div class="cost-legend">
+          <span class="leg"><i class="leg-hit"></i>缓存命中</span>
+          <span class="leg"><i class="leg-miss"></i>未命中</span>
+          <span class="leg"><i class="leg-out"></i>输出</span>
         </div>
       </div>
       <div class="tips">
@@ -171,7 +188,7 @@
         <label>回复预留 token
           <input id="cfg-reserve" type="number" min="64" max="8192" />
         </label>
-        <label>近期历史主动折叠阈值(token,0=禁用)
+        <label>方案一:历史主动折叠阈值(token,0=禁用)
           <input id="cfg-history-target" type="number" min="0" max="65536" />
         </label>
         <label class="check">超预算时用 LLM 折叠旧消息为摘要(缓存友好)
@@ -214,11 +231,20 @@
         <label class="check">启用记忆系统(模型可自动写入)
           <input id="cfg-memory" type="checkbox" />
         </label>
-        <label>记忆位置
+        <label>记忆位置策略
           <select id="cfg-mem-placement">
-            <option value="front">历史前(记忆+历史都命中缓存)</option>
-            <option value="back">历史后(记忆变更不影响历史)</option>
+            <option value="back">方案一:历史→记忆→提问(记忆少/变化频繁)</option>
+            <option value="front">方案二:摘要→记忆→新历史→提问(记忆多/稳定)</option>
           </select>
+        </label>
+        <label class="check">自动控制(按成本模型推荐方案,切换需弹窗审批)
+          <input id="cfg-mem-auto" type="checkbox" />
+        </label>
+        <label>方案二:新历史折叠阈值(token)
+          <input id="cfg-recent-tokens" type="number" min="200" max="65536" />
+        </label>
+        <label>方案二:折叠时保留最近条数
+          <input id="cfg-recent-keep" type="number" min="2" max="100" />
         </label>
         <label>记忆条数上限
           <input id="cfg-mem-max" type="number" min="1" max="200" />
@@ -235,7 +261,22 @@
       </div>
       <div id="memory-list"></div>
       <div class="tips">
-        <p>💡 记忆按群/私聊独立,作为独立 system 消息放在人设之后——记忆变化不影响人设与历史的缓存命中。模型通过回复末尾 <code>[记忆:添加 xxx]</code> 标记自动写入;QQ 里可用 <code>/remember</code> <code>/forget</code> <code>/memories</code> 管理。</p>
+        <p>💡 两方案的区别与适用场景(详见 README「记忆位置策略」):<b>方案一</b>记忆在历史之后——历史每轮增长,记忆每轮都吃未命中价,适合记忆少、变化频繁;<b>方案二</b>记忆在摘要之后、新历史之前——记忆稳定吃命中价(约 1/50 价格),但记忆变更/折叠摘要时断一次缓存,适合记忆多、变化少。新历史超过阈值时把超出「保留条数」的部分摘要进旧历史。</p>
+        <p>💡 开启「自动控制」后,程序按真实价格与实测指标(记忆大小/变更频率/每轮增长)持续评估,连续多轮结论一致且净收益大于切换成本时,弹出醒目审批窗,你批准后才切换;切换后有 24 小时冷却,不会在分界线附近反复横跳。</p>
+        <p>💡 模型通过回复末尾 <code>[记忆:添加 xxx]</code> 标记自动写入;QQ 里可用 <code>/remember</code> <code>/forget</code> <code>/memories</code> 管理。</p>
+      </div>
+      <h3>消息忽略与费用预算</h3>
+      <div class="form-grid narrow">
+        <label class="check">忽略 * 前缀消息(QQ 消息以 * 开头时不回复、不入历史)
+          <input id="cfg-ignore-star" type="checkbox" />
+        </label>
+        <label>钱包余额(元,手动填写;面板显示「余额 − 今日费用」)
+          <input id="cfg-wallet" type="number" step="0.01" min="0" />
+        </label>
+      </div>
+      <div class="tips">
+        <p>💡 * 前缀消息完全绕过模型(不回复、不触发、不占上下文),只在日志与会话详情里留痕——群友可以自由用 <code>*xxx</code> 闲聊而不会被机器人接话。</p>
+        <p>💡 每个模型的输入(命中/未命中)与输出单价在「模型设置」的模型卡片里填写(元 / 百万 tokens)。DeepSeek 近期多次调价,请以官方定价页为准:https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ 。内置默认:V4-Flash 0.02 / 1 / 2,V4-Pro 0.025 / 3 / 6。</p>
       </div>
       <h3>主动插话(活人感)</h3>
       <div class="form-grid narrow">
@@ -275,9 +316,12 @@
       </div>
       <h3 style="display:flex;align-items:center;gap:10px">会话列表 <button id="btn-refresh-sessions" class="btn small">刷新</button></h3>
       <table id="session-table">
-        <thead><tr><th>会话</th><th>消息数</th><th>约 tokens</th><th>摘要</th><th></th></tr></thead>
+        <thead><tr><th>状态</th><th>会话</th><th>消息数</th><th>约 tokens</th><th>摘要</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
+      <div class="tips">
+        <p>💡 点击任意一行打开该会话的详情页:收到的消息、思考过程、决策器结论、模型输出与最终回复的时间线(进行中实时流式展示),支持编辑/删除聊天记录与停止当前回复。</p>
+      </div>
     </section>
 
     <!-- 人设管理 -->
@@ -312,6 +356,35 @@
 
   </main>
 </div>
+
+<!-- 会话详情页(时间线 / 流式 / 编辑 / 停止) -->
+<div id="session-detail" class="overlay hidden">
+  <div class="detail-panel">
+    <div class="detail-head">
+      <button id="btn-detail-back" class="btn">← 返回</button>
+      <b id="detail-title">会话</b>
+      <span id="detail-status" class="capsule st-idle">空闲</span>
+      <span id="detail-meta" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="btn-detail-stop" class="btn danger">■ 停止</button>
+    </div>
+    <div id="detail-summary" class="detail-summary hidden"></div>
+    <div id="detail-timeline" class="detail-timeline"></div>
+  </div>
+</div>
+
+<!-- 记忆位置切换审批弹窗(醒目,需用户批准) -->
+<div id="approval-modal" class="modal-backdrop hidden">
+  <div class="modal-card">
+    <div class="modal-title">⚠️ 记忆位置切换建议(需你批准)</div>
+    <div id="approval-body" class="modal-body"></div>
+    <div class="modal-actions">
+      <button id="btn-approve-yes" class="btn accent">同意切换</button>
+      <button id="btn-approve-no" class="btn">暂不切换</button>
+    </div>
+  </div>
+</div>
+
 <script src="app.js"></script>
 </body>
 </html>

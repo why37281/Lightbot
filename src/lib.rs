@@ -1,9 +1,12 @@
 mod chat;
 mod commands;
 mod config;
+mod cost;
 mod llm;
 mod memory;
 mod napcat;
+mod placement;
+mod trace;
 mod trigger;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -23,10 +26,17 @@ pub fn run() {
             commands::test_llm,
             commands::get_sessions,
             commands::clear_session,
+            commands::get_session_detail,
+            commands::update_history_msg,
+            commands::delete_history_msg,
+            commands::stop_session,
             commands::get_status_view,
             commands::get_all_memories,
             commands::add_memory,
             commands::delete_memory,
+            commands::get_cost_overview,
+            commands::get_placement_proposal,
+            commands::approve_placement,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -79,12 +89,20 @@ mod tests {
         let (sender, _conn_task) = napcat.clone().run(cancel.clone()).await;
 
         let (fe_tx, _fe_rx) = mpsc::channel::<crate::chat::FrontendEvent>(64);
+        let cost = Arc::new(std::sync::Mutex::new(
+            crate::cost::CostTracker::new(std::env::temp_dir().join("lightbot_e2e_usage")),
+        ));
+        let placement = Arc::new(std::sync::Mutex::new(
+            crate::placement::PlacementController::default(),
+        ));
         let chat = Arc::new(ChatCore::new(
             cfg.clone(),
             sender,
             std::env::temp_dir().join("lightbot_e2e_sessions"),
             std::env::temp_dir().join("lightbot_e2e_config.json"),
             fe_tx,
+            cost,
+            placement,
         ));
 
         // 事件管线
@@ -223,6 +241,29 @@ mod tests {
                 .await;
         }
 
+        // 发送群消息 3:斜杠命令(无 key 也能处理,不走 LLM;回归:命令死锁 bug)
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let msg3 = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 12345,
+            "user_id": 67890,
+            "self_id": 10001,
+            "message": [
+                {"type": "text", "data": {"text": "/stats"}}
+            ]
+        });
+        {
+            let mut ws = ws.lock().await;
+            let _ = ws
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    tokio_tungstenite::tungstenite::Utf8Bytes::from(
+                        serde_json::to_string(&msg3).unwrap(),
+                    ),
+                ))
+                .await;
+        }
+
         let (got_send, got_reply) = tokio::time::timeout(Duration::from_secs(20), reader)
             .await
             .expect("测试超时")
@@ -232,8 +273,9 @@ mod tests {
         cancel.cancel();
         // 清理会话文件
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("lightbot_e2e_sessions"));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("lightbot_e2e_usage"));
 
-        assert!(got_send >= 2, "应收到至少 2 次 send_group_msg(at 触发 + 软 at 触发),实际 {got_send}");
+        assert!(got_send >= 3, "应收到至少 3 次 send_group_msg(at 触发 + 软 at 触发 + /stats 命令),实际 {got_send}");
         assert!(
             got_reply >= 2,
             "无 key 时 LLM 调用应失败并回复「出错了」提示,实际 {got_reply}"

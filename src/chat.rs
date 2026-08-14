@@ -1,27 +1,40 @@
 //! 会话与上下文管理 —— 缓存优化核心。
 //!
-//! 缓存友好原则(针对 DeepSeek 自动 context caching):
-//! 1. 稳定前缀:system(人设)固定在最前,摘要紧随其后,历史消息只追加、从不改写;
+//! ## 缓存友好原则(针对 DeepSeek 自动 context caching)
+//!
+//! 1. 稳定前缀:system(人设)固定在最前,摘要紧随其后;
 //! 2. 头部截断:超出预算时只从最旧消息开始丢弃,剩余部分保持逐字节不变 → 前缀哈希命中;
-//! 3. 摘要折叠:需要大量丢弃时,把丢弃部分用 LLM 压缩成固定摘要插入前缀区,之后继续追加;
+//! 3. 记忆位置分两方案(详见 `placement.rs`):
+//!    - 方案一(back):[人设][摘要][历史][记忆][轨迹][提问] —— 记忆随历史增长每轮 miss;
+//!    - 方案二(front):[人设][摘要][记忆][新历史][轨迹][提问] —— 记忆稳定命中,
+//!      新历史超过 `recent_max_tokens` 时把超出「保留条数」的部分折叠进摘要;
 //! 4. 会话持久化(JSONL):重启后同一会话继续追加,缓存可跨重启延续。
 //!
 //! 每个会话串行处理(try_lock 防堆积),token 估算轻量(字符级,可配保守系数)。
+//!
+//! ## 会话状态机
+//!
+//! 空闲 → (决策中,仅决策器开启时) → 回复中 → 思考中 → 回复中 → 空闲。
+//! 「思考中」只覆盖首 token 之后仍在输出 reasoning 的阶段(首 token 前的网络等待算回复中);
+//! 执行中 / 审批中 为 agent 功能预留的占位状态。
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
-use crate::config::Config;
-use crate::llm::{ApiMessage, LlmClient};
+use crate::config::{Config, MemoryConfig, ModelConfig, TrailConfig};
+use crate::cost::{CostTracker, UsageRecord};
+use crate::llm::{ApiMessage, LlmClient, StreamEvent, Usage, USER_STOPPED};
 use crate::memory::{self, MemoryOp, MemoryStore};
 use crate::napcat::{ActionSender, ConnStatus, MsgKind, ParsedMsg};
+use crate::placement::{self, Eval, PlacementController, Prices, Scheme};
+use crate::trace::{self, TraceEvent, TraceStore};
 use crate::trigger;
 
 // ---------- 前端事件 ----------
@@ -52,6 +65,19 @@ pub enum FrontendEvent {
         tokens: u64,
     },
     Notice { desc: String, notice_type: String },
+    /// 会话状态变化(会话列表胶囊灯)
+    SessionStatus { key: String, status: String },
+    /// 完整轨迹事件(会话详情页时间线 + 落盘)
+    Trace { key: String, entry: TraceEvent },
+    /// 流式增量:kind = "think" | "out"(会话详情页直播)
+    TurnDelta {
+        key: String,
+        turn: String,
+        kind: String,
+        text: String,
+    },
+    /// 记忆位置切换提案(醒目弹窗审批)
+    PlacementProposal { proposal: placement::Proposal },
 }
 
 // ---------- token 估算 ----------
@@ -92,6 +118,9 @@ pub struct HistoryMsg {
     /// 估算 token(落盘,便于文件级统计)
     #[serde(default)]
     pub tokens: u32,
+    /// 稳定 id(与轨迹联动,详情页编辑/删除用;旧文件缺省时加载时生成)
+    #[serde(default)]
+    pub id: String,
 }
 
 pub struct Session {
@@ -116,9 +145,7 @@ impl Session {
             last_active: Instant::now(),
             file: dir.join(format!("{key}.jsonl")),
             loaded: false,
-            memory: MemoryStore::new(
-                dir.join("memories").join(format!("{key}.jsonl")),
-            ),
+            memory: MemoryStore::new(dir.join("memories").join(format!("{key}.jsonl"))),
         }
     }
 
@@ -130,16 +157,30 @@ impl Session {
         self.loaded = true;
         if let Ok(content) = std::fs::read_to_string(&self.file) {
             for line in content.lines() {
-                if let Ok(h) = serde_json::from_str::<HistoryMsg>(line) {
-                    if h.role == "__summary__" {
-                        self.summary_tokens = estimate_tokens(&h.text, 1.15);
-                        self.summary = Some(h.text);
-                        continue;
-                    }
-                    self.history.push(h);
+                let mut h = match serde_json::from_str::<HistoryMsg>(line) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if h.role == "__summary__" {
+                    self.summary_tokens = estimate_tokens(&h.text, 1.15);
+                    self.summary = Some(h.text);
+                    continue;
                 }
+                if h.id.is_empty() {
+                    h.id = trace::new_id();
+                }
+                self.history.push(h);
             }
         }
+    }
+
+    /// 编辑后强制从磁盘重载(GUI 改写了历史文件)
+    pub fn reload_from_disk(&mut self) {
+        self.loaded = false;
+        self.history.clear();
+        self.summary = None;
+        self.summary_tokens = 0;
+        self.ensure_loaded();
     }
 
     /// 全量重写会话文件(摘要 + 历史),用于截断/摘要折叠后保证磁盘与内存一致
@@ -153,6 +194,7 @@ impl Session {
                     text: s.clone(),
                     ts: 0,
                     tokens: 0,
+                    id: String::new(),
                 };
                 if let Ok(l) = serde_json::to_string(&line) {
                     out.push_str(&l);
@@ -169,8 +211,8 @@ impl Session {
         }
     }
 
-    /// 追加一条并落盘
-    fn push(&mut self, role: &str, text: &str, ratio: f64) {
+    /// 追加一条并落盘,返回该条 token 估算
+    fn push_id(&mut self, role: &str, text: &str, ratio: f64, id: &str) -> u32 {
         let tokens = estimate_tokens(text, ratio);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -181,6 +223,7 @@ impl Session {
             text: text.to_string(),
             ts,
             tokens,
+            id: id.to_string(),
         };
         if let Some(dir) = self.file.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -195,6 +238,14 @@ impl Session {
             }
         }
         self.history.push(h);
+        tokens
+    }
+
+    /// 追加一条(自动生成 id;测试与外部工具使用)
+    #[cfg(test)]
+    fn push(&mut self, role: &str, text: &str, ratio: f64) {
+        let id = trace::new_id();
+        self.push_id(role, text, ratio, &id);
     }
 
     fn clear(&mut self) {
@@ -210,6 +261,66 @@ impl Session {
     }
 }
 
+/// 从磁盘读取会话摘要信息(供详情页与列表;机器人未运行也可用)
+pub fn read_history_summary(file: &Path) -> (usize, u64, bool, Option<String>) {
+    let mut count = 0usize;
+    let mut tokens = 0u64;
+    let mut has_summary = false;
+    let mut summary = None;
+    if let Ok(content) = std::fs::read_to_string(file) {
+        for line in content.lines() {
+            if let Ok(h) = serde_json::from_str::<HistoryMsg>(line) {
+                if h.role == "__summary__" {
+                    has_summary = true;
+                    summary = Some(h.text);
+                    continue;
+                }
+                count += 1;
+                tokens += h.tokens as u64;
+            }
+        }
+    }
+    (count, tokens, has_summary, summary)
+}
+
+// ---------- 会话状态 ----------
+
+/// 会话状态(执行中/审批中为 agent 功能预留的占位状态,当前未启用)
+#[allow(dead_code)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Idle,
+    Replying,
+    Thinking,
+    Deciding,
+    Executing,
+    Approval,
+}
+
+impl SessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionStatus::Idle => "idle",
+            SessionStatus::Replying => "replying",
+            SessionStatus::Thinking => "thinking",
+            SessionStatus::Deciding => "deciding",
+            SessionStatus::Executing => "executing",
+            SessionStatus::Approval => "approval",
+        }
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            SessionStatus::Idle => "空闲",
+            SessionStatus::Replying => "回复中",
+            SessionStatus::Thinking => "思考中",
+            SessionStatus::Deciding => "决策中",
+            SessionStatus::Executing => "执行中",
+            SessionStatus::Approval => "审批中",
+        }
+    }
+}
+
 // ---------- 业务核心 ----------
 
 pub struct ChatCore {
@@ -221,7 +332,7 @@ pub struct ChatCore {
     /// 配置文件路径(/model、/prompt 命令切换后自动保存)
     pub cfg_path: PathBuf,
     pub events: mpsc::Sender<FrontendEvent>,
-    /// 群活跃度跟踪:key -> 最近 5 分钟消息时间戳(插话采样用)
+    /// 群活跃度跟踪:key -> 最近窗口内消息时间戳(插话采样用)
     pub activity: StdMutex<HashMap<String, VecDeque<Instant>>>,
     /// 每群消息计数(插话条数冷却)
     pub msg_count: StdMutex<HashMap<String, u64>>,
@@ -229,6 +340,18 @@ pub struct ChatCore {
     pub interject_at: StdMutex<HashMap<String, u64>>,
     /// 群聊轨迹:未触发对话的普通消息缓冲(key -> (时间, 文本))
     pub trail: StdMutex<HashMap<String, VecDeque<(SystemTime, String)>>>,
+    /// 会话状态(列表胶囊灯)
+    pub status: StdMutex<HashMap<String, SessionStatus>>,
+    /// 进行中回复的中止通道(key -> sender)
+    pub aborts: StdMutex<HashMap<String, watch::Sender<bool>>>,
+    /// 费用追踪(与命令层共享)
+    pub cost: Arc<StdMutex<CostTracker>>,
+    /// 记忆位置自动控制状态(与命令层共享)
+    pub placement: Arc<StdMutex<PlacementController>>,
+    /// 记忆变更计数(评估变更概率用)
+    pub mem_changes: AtomicU64,
+    /// 轨迹目录
+    pub trace_dir: PathBuf,
 }
 
 impl ChatCore {
@@ -238,12 +361,16 @@ impl ChatCore {
         sessions_dir: PathBuf,
         cfg_path: PathBuf,
         events: mpsc::Sender<FrontendEvent>,
+        cost: Arc<StdMutex<CostTracker>>,
+        placement: Arc<StdMutex<PlacementController>>,
     ) -> Self {
+        let trace_dir = sessions_dir.join("traces");
         Self {
             cfg,
             llm: LlmClient::new(),
             sender,
             sessions: RwLock::new(HashMap::new()),
+            trace_dir,
             sessions_dir,
             cfg_path,
             events,
@@ -251,6 +378,11 @@ impl ChatCore {
             msg_count: StdMutex::new(HashMap::new()),
             interject_at: StdMutex::new(HashMap::new()),
             trail: StdMutex::new(HashMap::new()),
+            status: StdMutex::new(HashMap::new()),
+            aborts: StdMutex::new(HashMap::new()),
+            cost,
+            placement,
+            mem_changes: AtomicU64::new(0),
         }
     }
 
@@ -261,12 +393,92 @@ impl ChatCore {
         });
     }
 
-    /// 事件入口:消息分流 —— 被动触发/软 at 走完整通道,插话采样走轻量通道
+    fn set_status(&self, key: &str, s: SessionStatus) {
+        {
+            let mut m = self.status.lock().unwrap();
+            let cur = m.entry(key.to_string()).or_insert(SessionStatus::Idle);
+            if *cur == s {
+                return;
+            }
+            *cur = s;
+        }
+        let _ = self.events.try_send(FrontendEvent::SessionStatus {
+            key: key.to_string(),
+            status: s.as_str().to_string(),
+        });
+    }
+
+    pub fn get_status(&self, key: &str) -> SessionStatus {
+        self.status
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(SessionStatus::Idle)
+    }
+
+    // ---------- 轨迹与费用 ----------
+
+    fn trace_push(&self, key: &str, ev: &TraceEvent) {
+        let _ = self.events.try_send(FrontendEvent::Trace {
+            key: key.to_string(),
+            entry: ev.clone(),
+        });
+        let store = TraceStore::new(self.trace_dir.join(format!("{key}.jsonl")));
+        store.push(ev);
+    }
+
+    fn turn_delta(&self, key: &str, turn: &str, kind: &str, text: &str) {
+        let _ = self.events.try_send(FrontendEvent::TurnDelta {
+            key: key.to_string(),
+            turn: turn.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+        });
+    }
+
+    fn record_usage(&self, model: &ModelConfig, category: &str, usage: &Usage) {
+        self.cost.lock().unwrap().record(UsageRecord {
+            ts: trace::now_ts(),
+            model: model.model.clone(),
+            category: category.to_string(),
+            prompt: usage.prompt_tokens,
+            cache_hit: usage.cache_hit,
+            cache_miss: usage.cache_miss,
+            completion: usage.completion_tokens,
+            reasoning: usage.reasoning_tokens,
+            price_input: model.price_input,
+            price_cache_hit: model.price_cache_hit,
+            price_output: model.price_output,
+        });
+    }
+
+    fn emit_llm_stats(&self, model: &ModelConfig, usage: &Usage, elapsed_ms: u64) {
+        let _ = self.events.try_send(FrontendEvent::LlmStats {
+            model: model.model.clone(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cache_hit: usage.cache_hit,
+            cache_miss: usage.cache_miss,
+            reasoning_tokens: usage.reasoning_tokens,
+            elapsed_ms,
+        });
+    }
+
+    /// 记忆发生变更时递增计数(模型写入/删除、/remember、/forget、GUI 增删)
+    pub fn mark_memory_changed(&self) {
+        self.mem_changes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ---------- 事件入口 ----------
+
+    /// 事件入口:消息分流 —— 被动触发/软 at/命令走完整通道,插话采样走轻量通道
     pub async fn handle_message(&self, msg: ParsedMsg) {
         if msg.is_self {
             return;
         }
         let key = session_key(&msg);
+        let turn = trace::new_id();
         self.emit_msg_in(&key, &msg.text);
 
         let cfg = self.cfg.read().await.clone();
@@ -274,24 +486,58 @@ impl ChatCore {
         let win_min = cfg.chat.interject.activity_window_minutes.max(1);
         self.track_activity(&key, win_min * 60);
 
-        // ① 被动触发(@/回复/关键词/私聊)→ 完整通道;群聊中 / 开头的命令消息也直接触发
-        let is_cmd = msg.kind == MsgKind::Group && msg.text.trim_start().starts_with('/');
-        if trigger::passive_hit(&cfg, &msg) || is_cmd {
+        // * 前缀消息:完全忽略(不回复、不入历史、不触发),给群友自由交流空间
+        if cfg.chat.ignore_star && msg.text.trim_start().starts_with('*') {
+            self.log("info", &format!("[{key}] * 前缀消息,忽略: {}", msg.text));
+            self.trace_push(
+                &key,
+                &TraceEvent::MsgIn {
+                    id: None,
+                    turn,
+                    ts: trace::now_ts(),
+                    trigger: "ignored".into(),
+                    text: msg.text.clone(),
+                    ignored: true,
+                },
+            );
+            return;
+        }
+
+        // 斜杠命令:群聊/私聊均可直接触发,跳过决策器(命令绝不因决策器被吞)
+        let is_cmd = msg.text.trim_start().starts_with('/');
+        if is_cmd {
+            self.full_dialogue(&key, &msg, &turn).await;
+            return;
+        }
+
+        // ① 被动触发(@/回复/关键词/私聊)→ 完整通道
+        if trigger::passive_hit(&cfg, &msg) {
             drop(cfg);
-            if self.decider_ok(&msg.text).await {
-                self.full_dialogue(&key, &msg).await;
+            if self.decider_ok(&key, &turn, &msg.text).await {
+                self.full_dialogue(&key, &msg, &turn).await;
             } else {
                 self.log("info", &format!("[{key}] 决策器:无需回复(被动触发)"));
+                self.trace_push(
+                    &key,
+                    &TraceEvent::MsgIn {
+                        id: None,
+                        turn: turn.clone(),
+                        ts: trace::now_ts(),
+                        trigger: "decided_no".into(),
+                        text: msg.text.clone(),
+                        ignored: true,
+                    },
+                );
             }
             return;
         }
         // ② 软 at(提到机器人称呼)→ 完整通道,必回,刷新插话冷却(决策器通过才回复)
         if msg.kind == MsgKind::Group && trigger::soft_at_hit(&cfg, &msg.text) {
             drop(cfg);
-            if self.decider_ok(&msg.text).await {
+            if self.decider_ok(&key, &turn, &msg.text).await {
                 self.mark_interjected(&key);
                 self.log("info", &format!("[{key}] 软 at 触发(称呼提及)"));
-                self.full_dialogue(&key, &msg).await;
+                self.full_dialogue(&key, &msg, &turn).await;
             } else {
                 self.log("info", &format!("[{key}] 决策器:无需回复(软 at)"));
             }
@@ -306,9 +552,9 @@ impl ChatCore {
             drop(cfg);
             // 插话消息未进历史,记录到轨迹
             self.record_trail(&key, &msg.text).await;
-            if self.decider_ok(&user_text).await {
+            if self.decider_ok(&key, &turn, &user_text).await {
                 self.log("info", &format!("[{key}] 主动插话: {user_text}"));
-                self.light_reply(&msg, &user_text).await;
+                self.light_reply(&msg, &user_text, &turn).await;
             } else {
                 // 决策拒绝也消耗本次插话机会,防止高频重试
                 self.mark_interjected(&key);
@@ -316,11 +562,20 @@ impl ChatCore {
             }
         } else {
             // 全部触发条件未命中:记录群聊轨迹(解决"鱼的记忆")
-            self.log(
-                "debug",
-                &format!("[{key}] 未触发回复逻辑: {}", msg.text),
-            );
+            self.log("debug", &format!("[{key}] 未触发回复逻辑: {}", msg.text));
             self.record_trail(&key, &msg.text).await;
+        }
+    }
+
+    fn trigger_label(&self, msg: &ParsedMsg) -> String {
+        if msg.kind == MsgKind::Private {
+            "private".into()
+        } else if msg.at_me {
+            "at".into()
+        } else if msg.reply_me {
+            "reply".into()
+        } else {
+            "keyword".into()
         }
     }
 
@@ -341,34 +596,68 @@ impl ChatCore {
 
     /// 决策器:开启时由当前模型判断这条消息是否需要回复。
     /// 关闭 / 无模型 / 决策调用失败 → 按需要回复处理(保守,不漏回消息)。
-    async fn decider_ok(&self, text: &str) -> bool {
-        let cfg = self.cfg.read().await;
-        if !cfg.chat.decider {
+    async fn decider_ok(&self, key: &str, turn: &str, text: &str) -> bool {
+        let (enabled, model, prompt) = {
+            let cfg = self.cfg.read().await;
+            (
+                cfg.chat.decider,
+                cfg.active_model().cloned(),
+                cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
+            )
+        };
+        if !enabled {
             return true;
         }
-        let model = cfg.active_model().cloned();
-        let prompt = cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default();
-        drop(cfg);
         let Some(model) = model else {
             return true;
         };
-        match self.llm.decide(&model, &prompt, text).await {
-            Ok(yes) => {
+        self.set_status(key, SessionStatus::Deciding);
+        let started = Instant::now();
+        let result = self.llm.decide(&model, &prompt, text).await;
+        self.set_status(key, SessionStatus::Idle);
+        let ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok((yes, usage)) => {
+                self.record_usage(&model, "decide", &usage);
+                self.emit_llm_stats(&model, &usage, ms);
+                self.trace_push(
+                    key,
+                    &TraceEvent::Decide {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: text.to_string(),
+                        verdict: yes,
+                        model: model.model.clone(),
+                        ms,
+                    },
+                );
                 self.log(
                     "info",
-                    &format!("决策器: {}这条消息", if yes { "需要回复" } else { "无需回复" }),
+                    &format!(
+                        "决策器: {}这条消息 ({}ms)",
+                        if yes { "需要回复" } else { "无需回复" },
+                        ms
+                    ),
                 );
                 yes
             }
             Err(e) => {
                 self.log("warn", &format!("决策器调用失败,按需要回复处理: {e}"));
+                self.trace_push(
+                    key,
+                    &TraceEvent::Error {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: format!("决策器失败: {e}"),
+                    },
+                );
                 true
             }
         }
     }
 
     /// 完整通道:会话级对话(命令 / 上下文预算 / 历史 / 落盘)
-    async fn full_dialogue(&self, key: &str, msg: &ParsedMsg) {
+    async fn full_dialogue(&self, key: &str, msg: &ParsedMsg, turn: &str) {
         // 会话内串行:busy 时忽略(日志记录)
         let sess = self.get_session(key).await;
         let Ok(mut session) = sess.try_lock() else {
@@ -382,10 +671,19 @@ impl ChatCore {
             &format!("[{key}] 会话加载: 历史 {} 条", session.history.len()),
         );
 
-        // 命令处理
+        // 命令处理(先于一切模型调用;返回 Some(回复) 表示已处理)
         let text = msg.text.trim();
         if text.starts_with('/') {
-            if self.handle_command(&mut session, msg, text).await {
+            if let Some(reply) = self.handle_command(&mut session, msg, text).await {
+                self.trace_push(
+                    key,
+                    &TraceEvent::Cmd {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: text.to_string(),
+                        reply,
+                    },
+                );
                 return;
             }
         }
@@ -399,15 +697,11 @@ impl ChatCore {
             return;
         }
 
-        // 上下文预算管理(缓存友好截断/摘要)
-        self.trim_context(&mut session, &user_text).await;
+        // 上下文预算管理(按当前记忆方案折叠/截断)
+        self.trim_context(&mut session, &user_text, turn).await;
 
-        // 组装消息(缓存友好顺序):
-        // [人设][记忆说明][摘要][记忆(front)][历史][记忆(back)][轨迹][提问]
-        // 记忆位置由配置决定:front = 摘要后/历史前(记忆与历史都命中,记忆变更断历史一次);
-        // back = 历史后(记忆变更不影响历史,但历史增长使记忆每轮 miss)。
-        // 轨迹(未触发消息)总在最后,变化只影响自身与提问。
-        let (prompt, model, mem_cfg, trail_cfg, ratio) = {
+        // 快照本轮所需配置(避免持锁跨 await)
+        let (prompt, model, mem_cfg, trail_cfg, ratio, reserve, pending_cfg) = {
             let cfg = self.cfg.read().await;
             (
                 cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
@@ -415,18 +709,266 @@ impl ChatCore {
                 cfg.chat.memory.clone(),
                 cfg.chat.trail.clone(),
                 cfg.chat.estimate_ratio,
+                cfg.chat.reserve_tokens,
+                (
+                    cfg.napcat.reply_pending,
+                    cfg.napcat.pending_text.clone(),
+                    cfg.napcat.pending_delay_secs,
+                ),
             )
         };
         let Some(model) = model else {
             self.log("error", "未配置可用模型");
             return;
         };
-        // 记忆管理说明作为恒定独立 system 消息(与人设分离):
-        // 开关切换不改变消息流前缀 → 缓存不受影响;关闭时仅不展示记忆内容、不执行标记
+
+        // 组装消息流(方案一/二由 mem_cfg.placement 决定;缓存友好顺序)
+        let msgs = self
+            .build_messages(
+                &session,
+                key,
+                msg,
+                &prompt,
+                &user_text,
+                &mem_cfg,
+                &trail_cfg,
+                ratio,
+            )
+            .await;
+
+        // 先落用户消息(即使模型失败也在历史里),再记轨迹
+        let user_id = trace::new_id();
+        let user_tokens = session.push_id("user", &user_text, ratio, &user_id) as f64;
+        self.emit_session(key, &session).await;
+        self.trace_push(
+            key,
+            &TraceEvent::MsgIn {
+                id: Some(user_id),
+                turn: turn.to_string(),
+                ts: trace::now_ts(),
+                trigger: self.trigger_label(msg),
+                text: user_text.clone(),
+                ignored: false,
+            },
+        );
+
+        // 回复中 → 流式调用(思考中/回复中由增量自动切换;首 token 前的等待算回复中)
+        self.set_status(key, SessionStatus::Replying);
+        let started = Instant::now();
+        let (abort_tx, abort_rx) = watch::channel(false);
+        self.aborts.lock().unwrap().insert(key.to_string(), abort_tx);
+
+        let (stream_result, pending_sent) = self
+            .run_streamed_chat(key, turn, msg, &model, &msgs, reserve, abort_rx, pending_cfg, started)
+            .await;
+
+        self.aborts.lock().unwrap().remove(key);
+        self.set_status(key, SessionStatus::Idle);
+
+        match stream_result {
+            Ok(reply) => {
+                self.record_usage(&model, "dialogue", &reply.usage);
+                let elapsed = started.elapsed().as_millis() as u64;
+                self.emit_llm_stats(&model, &reply.usage, elapsed);
+                self.log(
+                    "info",
+                    &format!(
+                        "[{key}] {}({}t, 缓存命中率 {:.0}%, {}ms{})",
+                        model.model,
+                        reply.usage.prompt_tokens,
+                        reply.usage.hit_ratio() * 100.0,
+                        elapsed,
+                        if reply.usage.reasoning_tokens > 0 {
+                            format!(", 思考 {}t", reply.usage.reasoning_tokens)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                );
+                // 思考过程落轨迹(直播增量已上抛,这里存全量)
+                if !reply.reasoning.is_empty() {
+                    self.trace_push(
+                        key,
+                        &TraceEvent::Think {
+                            turn: turn.to_string(),
+                            ts: trace::now_ts(),
+                            text: reply.reasoning.clone(),
+                            tokens: reply.usage.reasoning_tokens,
+                        },
+                    );
+                }
+                // 记忆标记:总是剥离(防止关闭状态泄漏到群里);仅开启时执行
+                let mut out = reply.text;
+                let (clean, ops) = memory::parse_memory_ops(&out);
+                out = clean;
+                let mut mem_changed = false;
+                if mem_cfg.enabled {
+                    for op in ops {
+                        match op {
+                            MemoryOp::Add(text) => {
+                                if session.memory.add(
+                                    &text,
+                                    "model",
+                                    mem_cfg.max_entries as usize,
+                                    mem_cfg.max_entry_chars as usize,
+                                ) {
+                                    mem_changed = true;
+                                    self.log("info", &format!("[{key}] 模型写入记忆: {text}"));
+                                }
+                            }
+                            MemoryOp::Remove(needle) => {
+                                if session.memory.remove_contains(&needle) > 0 {
+                                    mem_changed = true;
+                                    self.log("info", &format!("[{key}] 模型删除记忆: {needle}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                if mem_changed {
+                    self.mark_memory_changed();
+                }
+                // 思考过程(reasoning_content)只用于统计,绝不发送给用户
+                if out.is_empty() {
+                    out = "(模型未返回内容)".into();
+                }
+                let send_result = self.send_text(msg, &out).await;
+                // 落盘助手消息 + 轨迹(发送失败也记录真实输出)
+                let assistant_id = trace::new_id();
+                let assistant_tokens = session.push_id("assistant", &out, ratio, &assistant_id) as f64;
+                self.emit_session(key, &session).await;
+                self.trace_push(
+                    key,
+                    &TraceEvent::MsgOut {
+                        id: Some(assistant_id),
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: out.clone(),
+                        model: model.model.clone(),
+                        usage: reply.usage.clone(),
+                    },
+                );
+                if let Err(e) = send_result {
+                    self.log("warn", &format!("[{key}] 回复发送失败: {e}"));
+                }
+                // 记忆位置自动评估(每轮喂指标,窗口满时评估)
+                self.feed_placement_round(user_tokens + assistant_tokens);
+                self.evaluate_placement(&session).await;
+            }
+            Err(e) => {
+                let stopped = e == USER_STOPPED;
+                self.trace_push(
+                    key,
+                    &TraceEvent::Error {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: if stopped {
+                            "已停止".to_string()
+                        } else {
+                            e.clone()
+                        },
+                    },
+                );
+                if stopped {
+                    // 已发过"思考中"提示则补一条停止告知,否则静默(用户自己按的停止)
+                    if pending_sent {
+                        let _ = self.send_text(msg, "⏹ 回复已停止。").await;
+                    }
+                } else {
+                    self.log("error", &format!("[{key}] 模型调用失败: {e}"));
+                    let _ = self.send_text(msg, &format!("⚠️ 出错了: {e}")).await;
+                }
+            }
+        }
+    }
+
+    /// 流式调用驱动:增量上抛 + 状态切换 + 思考提示计时。
+    /// 返回(结果, 是否已发思考提示)。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_streamed_chat(
+        &self,
+        key: &str,
+        turn: &str,
+        msg: &ParsedMsg,
+        model: &ModelConfig,
+        msgs: &[ApiMessage],
+        reserve: u32,
+        cancel: watch::Receiver<bool>,
+        pending_cfg: (bool, String, u64),
+        started: Instant,
+    ) -> (Result<crate::llm::LlmReply, String>, bool) {
+        let mut stream = match self
+            .llm
+            .chat_stream(model, msgs, Some(reserve), cancel)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return (Err(e), false),
+        };
+        let (pending_enabled, pending_text, pending_delay) = pending_cfg;
+        let mut pending_sent = false;
+        let mut first_token_at: Option<Instant> = None;
+        let mut got_content = false;
+        loop {
+            tokio::select! {
+                ev = stream.next_event() => {
+                    match ev {
+                        None => break,
+                        Some(Err(e)) => return (Err(e), pending_sent),
+                        Some(Ok(StreamEvent::Reasoning { delta })) => {
+                            if first_token_at.is_none() {
+                                first_token_at = Some(Instant::now());
+                            }
+                            self.set_status(key, SessionStatus::Thinking);
+                            self.turn_delta(key, turn, "think", &delta);
+                        }
+                        Some(Ok(StreamEvent::Content { delta })) => {
+                            if first_token_at.is_none() {
+                                first_token_at = Some(Instant::now());
+                            }
+                            got_content = true;
+                            self.set_status(key, SessionStatus::Replying);
+                            self.turn_delta(key, turn, "out", &delta);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    // 思考提示:首 token 之后的纯思考超过阈值才发(首 token 前的等待不计入);
+                    // 长时间无首 token 视为网络停滞,兜底提示
+                    let stall = first_token_at.is_none()
+                        && started.elapsed()
+                            >= Duration::from_secs(pending_delay.saturating_mul(2).saturating_add(15));
+                    let thinking_too_long = first_token_at
+                        .map(|t| !got_content && t.elapsed() >= Duration::from_secs(pending_delay))
+                        .unwrap_or(false);
+                    if pending_enabled && !pending_sent && (thinking_too_long || stall) {
+                        let _ = self.send_text(msg, &pending_text).await;
+                        pending_sent = true;
+                    }
+                }
+            }
+        }
+        (Ok(stream.finish()), pending_sent)
+    }
+
+    /// 组装消息流(缓存友好顺序,方案由 placement 决定):
+    /// 方案二(front):[人设][记忆说明][摘要][记忆][历史][轨迹][提问]
+    /// 方案一(back): [人设][记忆说明][摘要][历史][记忆][轨迹][提问]
+    async fn build_messages(
+        &self,
+        session: &Session,
+        key: &str,
+        msg: &ParsedMsg,
+        prompt: &str,
+        user_text: &str,
+        mem_cfg: &MemoryConfig,
+        trail_cfg: &TrailConfig,
+        ratio: f64,
+    ) -> Vec<ApiMessage> {
         let mut msgs = vec![
             ApiMessage {
                 role: "system".into(),
-                content: prompt,
+                content: prompt.to_string(),
             },
             ApiMessage {
                 role: "system".into(),
@@ -439,20 +981,13 @@ impl ChatCore {
                 content: format!("[先前对话摘要]\n{s}"),
             });
         }
-        // 记忆内容:按 placement 决定插在摘要后(历史前)还是历史后
+        // 记忆内容(trim_context 中已刷新与裁剪)
         let mut mem_msg: Option<ApiMessage> = None;
-        if mem_cfg.enabled {
-            session.memory.refresh();
-            self.log(
-                "debug",
-                &format!("[{key}] 记忆: {} 条", session.memory.entries.len()),
-            );
-            if !session.memory.entries.is_empty() {
-                mem_msg = Some(ApiMessage {
-                    role: "system".into(),
-                    content: session.memory.system_text(),
-                });
-            }
+        if mem_cfg.enabled && !session.memory.entries.is_empty() {
+            mem_msg = Some(ApiMessage {
+                role: "system".into(),
+                content: session.memory.system_text(),
+            });
         }
         if mem_cfg.placement != "back" {
             if let Some(m) = mem_msg.clone() {
@@ -472,14 +1007,13 @@ impl ChatCore {
         }
         // 群聊轨迹:最近未触发消息(位于最后,变化不影响历史/记忆缓存)
         if trail_cfg.enabled && msg.kind == MsgKind::Group {
-            let lines = {
-                self.trail
-                    .lock()
-                    .unwrap()
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_default()
-            };
+            let lines = self
+                .trail
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .unwrap_or_default();
             if let Some(content) = render_trail(
                 &lines,
                 trail_cfg.window_minutes.max(1) * 60,
@@ -494,128 +1028,13 @@ impl ChatCore {
         }
         msgs.push(ApiMessage {
             role: "user".into(),
-            content: user_text.clone(),
+            content: user_text.to_string(),
         });
-
-        // 先存用户消息(即使失败也在历史里)
-        {
-            let cfg = self.cfg.read().await;
-            let ratio = cfg.chat.estimate_ratio;
-            session.push("user", &user_text, ratio);
-            self.emit_session(key, &session).await;
-            drop(cfg);
-        }
-
-        // 调 LLM:思考提示改为延迟触发 —— 仅当思考超过阈值仍未返回才发提示,
-        // 避免一开始就发一条突兀的消息;首 token 到达前的等待(约 3-5s)
-        // 不计入思考时间,按 4s 估计扣除(非流式请求无法精确获知首 token 时刻)
-        let started = Instant::now();
-        let (pending_enabled, pending_text, pending_delay) = {
-            let cfg = self.cfg.read().await;
-            (
-                cfg.napcat.reply_pending,
-                cfg.napcat.pending_text.clone(),
-                cfg.napcat.pending_delay_secs,
-            )
-        };
-        let max_tokens = {
-            let cfg = self.cfg.read().await;
-            cfg.chat.reserve_tokens
-        };
-        let reply = if pending_enabled {
-            let chat_fut = self.llm.chat(&model, &msgs, Some(max_tokens));
-            tokio::pin!(chat_fut);
-            let threshold = Duration::from_secs(pending_delay.saturating_add(4));
-            let mut prompted = false;
-            let result = loop {
-                tokio::select! {
-                    r = &mut chat_fut => break Some(r),
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        if !prompted && started.elapsed() >= threshold {
-                            let _ = self.send_text(msg, &pending_text).await;
-                            prompted = true;
-                        }
-                    }
-                }
-            };
-            result
-        } else {
-            Some(self.llm.chat(&model, &msgs, Some(max_tokens)).await)
-        };
-        match reply {
-            Some(Ok(reply)) => {
-                let elapsed = started.elapsed().as_millis() as u64;
-                let _ = self.events.try_send(FrontendEvent::LlmStats {
-                    model: model.model.clone(),
-                    prompt_tokens: reply.usage.prompt_tokens,
-                    completion_tokens: reply.usage.completion_tokens,
-                    cache_hit: reply.usage.cache_hit,
-                    cache_miss: reply.usage.cache_miss,
-                    reasoning_tokens: reply.usage.reasoning_tokens,
-                    elapsed_ms: elapsed,
-                });
-                self.log(
-                    "info",
-                    &format!(
-                        "[{key}] {}({}t, 缓存命中率 {:.0}%, {}ms{})",
-                        model.model,
-                        reply.usage.prompt_tokens,
-                        reply.usage.hit_ratio() * 100.0,
-                        elapsed,
-                        if reply.usage.reasoning_tokens > 0 {
-                            format!(", 思考 {}t", reply.usage.reasoning_tokens)
-                        } else {
-                            String::new()
-                        }
-                    ),
-                );
-                let mut out = reply.text;
-                // 记忆标记:总是剥离(防止关闭状态泄漏到群里);仅开启时执行
-                let (clean, ops) = memory::parse_memory_ops(&out);
-                out = clean;
-                if mem_cfg.enabled {
-                    for op in ops {
-                        match op {
-                            MemoryOp::Add(text) => {
-                                if session.memory.add(
-                                    &text,
-                                    "model",
-                                    mem_cfg.max_entries as usize,
-                                    mem_cfg.max_entry_chars as usize,
-                                ) {
-                                    self.log("info", &format!("[{key}] 模型写入记忆: {text}"));
-                                }
-                            }
-            MemoryOp::Remove(needle) => {
-                                if session.memory.remove_contains(&needle) > 0 {
-                                    self.log("info", &format!("[{key}] 模型删除记忆: {needle}"));
-                                }
-                            }
-                        }
-                    }
-                }
-                // 思考过程(reasoning_content)只用于统计,绝不发送给用户
-                if out.is_empty() {
-                    out = "(模型未返回内容)".into();
-                }
-                let _ = self.send_text(msg, &out).await;
-                {
-                    let cfg = self.cfg.read().await;
-                    let ratio = cfg.chat.estimate_ratio;
-                    session.push("assistant", &out, ratio);
-                    self.emit_session(key, &session).await;
-                }
-            }
-            Some(Err(e)) => {
-                self.log("error", &format!("[{key}] 模型调用失败: {e}"));
-                let _ = self.send_text(msg, &format!("⚠️ 出错了: {e}")).await;
-            }
-            None => unreachable!(),
-        }
+        msgs
     }
 
     /// 轻量通道:单轮插话(极小上下文、不落盘、不新开会话、失败静默)
-    async fn light_reply(&self, msg: &ParsedMsg, user_text: &str) {
+    async fn light_reply(&self, msg: &ParsedMsg, user_text: &str, turn: &str) {
         let (prompt, model, max_tokens) = {
             let cfg = self.cfg.read().await;
             (
@@ -627,6 +1046,7 @@ impl ChatCore {
         let Some(model) = model else {
             return;
         };
+        let key = session_key(msg);
         let msgs = vec![
             ApiMessage {
                 role: "system".into(),
@@ -639,8 +1059,11 @@ impl ChatCore {
                 content: user_text.to_string(),
             },
         ];
+        let started = Instant::now();
         match self.llm.chat(&model, &msgs, Some(max_tokens)).await {
             Ok(reply) => {
+                self.record_usage(&model, "interject", &reply.usage);
+                self.emit_llm_stats(&model, &reply.usage, started.elapsed().as_millis() as u64);
                 // 插话场景剥离记忆标记但不执行(轻量通道不管理记忆)
                 let (text, _) = memory::parse_memory_ops(&reply.text);
                 let out = if text.is_empty() {
@@ -649,13 +1072,556 @@ impl ChatCore {
                     text
                 };
                 let _ = self.send_text(msg, &out).await;
+                self.trace_push(
+                    &key,
+                    &TraceEvent::LiteOut {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: out,
+                        model: model.model.clone(),
+                    },
+                );
             }
             Err(e) => {
                 // 插话失败静默,不打扰群
-                self.log("warn", &format!("[{}] 插话失败: {e}", session_key(msg)));
+                self.log("warn", &format!("[{key}] 插话失败: {e}"));
+                self.trace_push(
+                    &key,
+                    &TraceEvent::Error {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: format!("插话失败: {e}"),
+                    },
+                );
             }
         }
     }
+
+    // ---------- 记忆位置自动控制 ----------
+
+    fn feed_placement_round(&self, growth_tokens: f64) {
+        let mut ctl = self.placement.lock().unwrap();
+        let cur = self.mem_changes.load(Ordering::Relaxed);
+        let changed = cur != ctl.mem_changes;
+        ctl.mem_changes = cur;
+        ctl.feed_round(changed, growth_tokens);
+    }
+
+    async fn evaluate_placement(&self, session: &Session) {
+        let (auto, placement_str, ratio, recent_cap, keep_msgs, sum_cap) = {
+            let cfg = self.cfg.read().await;
+            (
+                cfg.chat.memory.auto_placement,
+                cfg.chat.memory.placement.clone(),
+                cfg.chat.estimate_ratio,
+                cfg.chat.recent_max_tokens as f64,
+                cfg.chat.recent_keep_msgs as f64,
+                cfg.chat.summarize_tokens as f64,
+            )
+        };
+        if !auto {
+            return;
+        }
+        let prices = {
+            let cfg = self.cfg.read().await;
+            match cfg.active_model() {
+                Some(m) => Prices {
+                    input: m.price_input,
+                    cache_hit: m.price_cache_hit,
+                    output: m.price_output,
+                },
+                None => Prices {
+                    input: 1.0,
+                    cache_hit: 0.02,
+                    output: 2.0,
+                },
+            }
+        };
+        let mut ctl = self.placement.lock().unwrap();
+        if ctl.rounds_in_window < placement::EVAL_EVERY {
+            return;
+        }
+        let hist = session.total_tokens() as f64;
+        let eval = Eval {
+            mem_tokens: session.memory.total_tokens(ratio) as f64,
+            recent_tokens: hist.min(recent_cap),
+            summary_tokens: session.summary_tokens as f64,
+            history_tokens: hist,
+            p_change: ctl.p_change,
+            growth: ctl.growth,
+            recent_cap: recent_cap.max(1.0),
+            keep_msgs,
+            summary_cap: sum_cap.max(64.0),
+            prices,
+        };
+        if let Some(p) = ctl.evaluate(&eval, Scheme::from_placement(&placement_str), trace::now_ts())
+        {
+            self.log("info", &format!("记忆位置评估:建议切换到 {}", p.to));
+            let _ = self
+                .events
+                .try_send(FrontendEvent::PlacementProposal { proposal: p });
+        }
+    }
+
+    // ---------- 命令 ----------
+
+    /// 内置斜杠命令,返回 Some(回复文本) 表示已处理。
+    /// ⚠️ 锁纪律:先快照所需配置再执行;写锁只在无读锁时获取
+    /// (历史 bug:/model、/prompt 持读锁跨写锁 await,造成死锁)。
+    async fn handle_command(&self, session: &mut Session, msg: &ParsedMsg, text: &str) -> Option<String> {
+        let (model_names, prompt_ids, mem_cfg) = {
+            let cfg = self.cfg.read().await;
+            (
+                cfg.models.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                cfg.prompts.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+                cfg.chat.memory.clone(),
+            )
+        };
+        let reply: String = match text {
+            "/clear" => {
+                session.clear();
+                self.emit_session(&session.key, session).await;
+                self.log("info", &format!("[{}] 已清空上下文", session.key));
+                "🧹 上下文已清空,重新开始对话。".to_string()
+            }
+            "/stats" => {
+                let toks = session.total_tokens();
+                self.log(
+                    "info",
+                    &format!(
+                        "[{}] 查看统计: {} 条消息,约 {} tokens",
+                        session.key,
+                        session.history.len(),
+                        toks
+                    ),
+                );
+                format!(
+                    "📊 当前会话:{} 条消息,约 {} tokens{}",
+                    session.history.len(),
+                    toks,
+                    session
+                        .summary
+                        .as_ref()
+                        .map(|_| "(含摘要)")
+                        .unwrap_or("")
+                )
+            }
+            _ => {
+                if let Some(rest) = text.strip_prefix("/remember ") {
+                    let content = rest.trim();
+                    if content.is_empty() {
+                        "用法:/remember <内容>".to_string()
+                    } else {
+                        session.memory.refresh();
+                        let ok = session.memory.add(
+                            content,
+                            "user",
+                            mem_cfg.max_entries as usize,
+                            mem_cfg.max_entry_chars as usize,
+                        );
+                        if ok {
+                            self.mark_memory_changed();
+                        }
+                        self.log(
+                            "info",
+                            &format!(
+                                "[{}] 用户添加记忆{}: {content}",
+                                session.key,
+                                if ok { "" } else { "(重复或为空)" }
+                            ),
+                        );
+                        if ok {
+                            format!("🧠 已记住: {content}")
+                        } else {
+                            "这条记忆为空或已存在。".to_string()
+                        }
+                    }
+                } else if let Some(rest) = text.strip_prefix("/forget ") {
+                    let content = rest.trim();
+                    session.memory.refresh();
+                    // 仅支持英文逗号分隔的数字序号,如 /forget 1,3
+                    let mut idxs: Vec<usize> = Vec::new();
+                    let mut valid = true;
+                    for part in content.split(',') {
+                        let p = part.trim();
+                        if p.is_empty() {
+                            continue;
+                        }
+                        match p.parse::<usize>() {
+                            Ok(i) => idxs.push(i),
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid || idxs.is_empty() {
+                        "用法:/forget <序号,逗号分隔,如 1,3>".to_string()
+                    } else {
+                        idxs.sort_unstable();
+                        idxs.dedup();
+                        // 从大到小删除,避免序号漂移
+                        let mut removed = 0;
+                        for idx in idxs.into_iter().rev() {
+                            if session.memory.remove_index(idx) {
+                                removed += 1;
+                            }
+                        }
+                        if removed > 0 {
+                            self.mark_memory_changed();
+                        }
+                        self.log(
+                            "info",
+                            &format!(
+                                "[{}] 用户删除记忆: 序号 [{}],删除 {removed} 条",
+                                session.key, content
+                            ),
+                        );
+                        if removed > 0 {
+                            format!("🗑️ 已删除 {removed} 条记忆。")
+                        } else {
+                            "未找到匹配的序号。".to_string()
+                        }
+                    }
+                } else if text == "/memories" {
+                    session.memory.refresh();
+                    if session.memory.entries.is_empty() {
+                        "🧠 暂无记忆。".to_string()
+                    } else {
+                        let scope = if msg.kind == MsgKind::Group {
+                            "本群"
+                        } else {
+                            "本会话"
+                        };
+                        let mut s = format!(
+                            "🧠 {scope}长期记忆({} 条):\n",
+                            session.memory.entries.len()
+                        );
+                        for (i, e) in session.memory.entries.iter().enumerate() {
+                            s.push_str(&format!(
+                                "{}. [{} {}] {}\n",
+                                i + 1,
+                                if e.source == "model" { "自动" } else { "用户" },
+                                crate::memory::fmt_ts(e.ts),
+                                e.text
+                            ));
+                        }
+                        s.push_str("\n💡 添加:/remember <内容> · 删除:/forget <序号,如 1,3>");
+                        self.log(
+                            "info",
+                            &format!("[{}] 查看记忆: {} 条", session.key, session.memory.entries.len()),
+                        );
+                        s
+                    }
+                } else if text == "/model" {
+                    format!("可用模型: {}", model_names.join(", "))
+                } else if let Some(rest) = text.strip_prefix("/model ") {
+                    let name = rest.trim();
+                    if model_names.iter().any(|m| m == name) {
+                        // 快照已 drop,此时可安全获取写锁(修复死锁)
+                        {
+                            let mut cfg = self.cfg.write().await;
+                            cfg.active_model = name.to_string();
+                        }
+                        {
+                            let cfg = self.cfg.read().await;
+                            let _ = crate::config::save_config(&self.cfg_path, &cfg);
+                        }
+                        self.log("info", &format!("[{}] 切换模型 -> {name}", session.key));
+                        format!("✅ 已切换模型: {name}")
+                    } else {
+                        format!("❌ 未找到模型 {name},可用: {}", model_names.join(", "))
+                    }
+                } else if text == "/prompt" {
+                    format!("可用人设: {}", prompt_ids.join(", "))
+                } else if let Some(rest) = text.strip_prefix("/prompt ") {
+                    let id = rest.trim();
+                    if prompt_ids.iter().any(|p| p == id) {
+                        {
+                            let mut cfg = self.cfg.write().await;
+                            cfg.active_prompt = id.to_string();
+                        }
+                        {
+                            let cfg = self.cfg.read().await;
+                            let _ = crate::config::save_config(&self.cfg_path, &cfg);
+                        }
+                        self.log("info", &format!("[{}] 切换人设 -> {id}", session.key));
+                        format!("✅ 已切换人设: {id}")
+                    } else {
+                        format!("❌ 未找到人设 {id},可用: {}", prompt_ids.join(", "))
+                    }
+                } else {
+                    return None;
+                }
+            }
+        };
+        let _ = self.send_text(msg, &reply).await;
+        Some(reply)
+    }
+
+    // ---------- 上下文预算 ----------
+
+    /// 上下文预算管理:按记忆方案折叠 + 兜底头部截断(缓存友好)。
+    async fn trim_context(&self, session: &mut Session, user_text: &str, turn: &str) {
+        let (budget, summarize, summarize_tokens, ratio, prompt, mem_cfg, history_target, recent_cap, recent_keep) = {
+            let cfg = self.cfg.read().await;
+            (
+                cfg.chat.context_tokens.saturating_sub(cfg.chat.reserve_tokens) as u64,
+                cfg.chat.summarize,
+                cfg.chat.summarize_tokens,
+                cfg.chat.estimate_ratio,
+                cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
+                cfg.chat.memory.clone(),
+                cfg.chat.history_target_tokens,
+                cfg.chat.recent_max_tokens as u64,
+                cfg.chat.recent_keep_msgs as usize,
+            )
+        };
+        let (prompt_tok, user_tok) = {
+            // 固定前缀 token:人设 + 记忆说明(恒定) + 当前提问
+            let pt = (estimate_tokens(&prompt, ratio) + estimate_tokens(MEMORY_GUIDE, ratio)) as u64;
+            (pt, estimate_tokens(user_text, ratio) as u64)
+        };
+        // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
+        let mut mem_tok: u64 = 0;
+        if mem_cfg.enabled {
+            session.memory.refresh();
+            session.memory.trim_to_tokens(mem_cfg.max_tokens.max(64), ratio);
+            mem_tok = session.memory.total_tokens(ratio) as u64;
+        }
+        let mut sum_tok = session.summary_tokens as u64;
+        let hist_tok: u64 = session.history.iter().map(|h| h.tokens as u64).sum();
+
+        // 预算报告(debug):裁剪前的占用明细
+        self.log(
+            "debug",
+            &format!(
+                "[{}] 上下文预算: 人设{prompt_tok} + 记忆{mem_tok} + 摘要{sum_tok} + 历史{hist_tok}({}条) / 总预算 {budget}t",
+                session.key,
+                session.history.len()
+            ),
+        );
+
+        // 摘要与历史共享的预算(输入预算扣除人设、记忆与当前提问)
+        let input_budget = budget.saturating_sub(prompt_tok + mem_tok + user_tok);
+        if input_budget <= sum_tok && session.summary.is_some() {
+            session.summary = None;
+            sum_tok = 0;
+            session.rewrite();
+        }
+
+        // 折叠策略:按记忆方案分派(均可关闭)
+        if summarize && session.history.len() > 2 {
+            let drop = if mem_cfg.placement == "front" {
+                // 方案二:新历史超阈值时折叠到 ≤ recent_cap(至少保留最近 keep 条);
+                // 折叠后历史从 keep 条重新积累,自然形成折叠周期(与成本模型一致)
+                let tokens: Vec<u32> = session.history.iter().map(|h| h.tokens).collect();
+                compute_drop(&tokens, recent_cap, recent_keep.max(1))
+            } else if history_target > 0 {
+                // 方案一:历史超过主动折叠阈值(或逼近预算)时折叠,至少丢 2 条
+                let fold_budget = input_budget
+                    .saturating_sub(sum_tok)
+                    .min(history_target as u64);
+                let tokens: Vec<u32> = session.history.iter().map(|h| h.tokens).collect();
+                if hist_tok > fold_budget {
+                    compute_drop(&tokens, fold_budget, 1).max(2)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if drop > 0 {
+                self.fold_history(session, drop, summarize_tokens, ratio, turn)
+                    .await;
+            }
+        }
+
+        // 兜底:无论方案与开关,超出预算时必须头部截断(修复历史 bug:关闭摘要时永不截断)
+        let final_budget = input_budget.saturating_sub(session.summary_tokens as u64);
+        let tokens: Vec<u32> = session.history.iter().map(|h| h.tokens).collect();
+        let drop = compute_drop(&tokens, final_budget, 0);
+        if drop > 0 {
+            session.history.drain(..drop);
+            session.rewrite();
+            self.log(
+                "info",
+                &format!("[{}] 上下文超预算,丢弃最旧 {} 条消息", session.key, drop),
+            );
+        }
+    }
+
+    /// 把最旧 drop 条折叠进摘要(失败则丢弃并落盘,保证磁盘与内存一致)
+    async fn fold_history(
+        &self,
+        session: &mut Session,
+        drop: usize,
+        summarize_tokens: u32,
+        ratio: f64,
+        turn: &str,
+    ) {
+        let dropped: Vec<HistoryMsg> = session.history.drain(..drop).collect();
+        let old_summary = session.summary.clone().unwrap_or_default();
+        let api_msgs: Vec<ApiMessage> = dropped
+            .iter()
+            .map(|h| ApiMessage {
+                role: h.role.clone(),
+                content: h.text.clone(),
+            })
+            .collect();
+        let model = self.cfg.read().await.active_model().cloned();
+        match model {
+            Some(model) => match self
+                .llm
+                .summarize(&model, &old_summary, &api_msgs, summarize_tokens)
+                .await
+            {
+                Ok((s, usage)) => {
+                    self.record_usage(&model, "summarize", &usage);
+                    session.summary = Some(s.clone());
+                    session.summary_tokens = estimate_tokens(&s, ratio);
+                    session.rewrite();
+                    self.trace_push(
+                        &session.key,
+                        &TraceEvent::Fold {
+                            turn: turn.to_string(),
+                            ts: trace::now_ts(),
+                            folded: dropped.len(),
+                            summary_tokens: session.summary_tokens,
+                        },
+                    );
+                    self.log(
+                        "info",
+                        &format!(
+                            "[{}] 已折叠 {} 条旧消息为摘要",
+                            session.key,
+                            dropped.len()
+                        ),
+                    );
+                }
+                Err(e) => {
+                    self.log("warn", &format!("[{}] 摘要生成失败: {e}", session.key));
+                    session.summary = None;
+                    session.summary_tokens = 0;
+                    session.rewrite();
+                }
+            },
+            None => {
+                // 无可用模型:丢弃部分也需落盘,保证磁盘与内存一致
+                session.rewrite();
+                self.log(
+                    "info",
+                    &format!(
+                        "[{}] 无可用模型,直接丢弃最旧 {} 条消息",
+                        session.key,
+                        dropped.len()
+                    ),
+                );
+            }
+        }
+    }
+
+    // ---------- 会话管理 ----------
+
+    async fn get_session(&self, key: &str) -> Arc<Mutex<Session>> {
+        {
+            let map = self.sessions.read().await;
+            if let Some(s) = map.get(key) {
+                return s.clone();
+            }
+        }
+        let mut map = self.sessions.write().await;
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(Session::new(key, &self.sessions_dir))))
+            .clone()
+    }
+
+    async fn reload_session(&self, key: &str) -> Result<(), String> {
+        let map = self.sessions.read().await;
+        let Some(sess) = map.get(key) else {
+            return Ok(());
+        };
+        let mut s = sess
+            .try_lock()
+            .map_err(|_| "会话正在回复中,请稍后再编辑".to_string())?;
+        s.reload_from_disk();
+        self.emit_session(key, &s).await;
+        Ok(())
+    }
+
+    /// 发送回复(自动分段)
+    async fn send_text(&self, msg: &ParsedMsg, text: &str) -> Result<(), String> {
+        let (max_len, delay) = {
+            let cfg = self.cfg.read().await;
+            (cfg.napcat.max_msg_len.max(1), cfg.napcat.segment_delay_ms)
+        };
+        let chunks: Vec<String> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(max_len)
+            .map(|c| c.iter().collect())
+            .collect();
+        if chunks.len() > 1 {
+            self.log(
+                "info",
+                &format!("[{}] 回复较长,分 {} 段发送", session_key(msg), chunks.len()),
+            );
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            let r = match msg.kind {
+                MsgKind::Group => {
+                    self.sender
+                        .send_group_msg(msg.group_id.unwrap_or(0), chunk)
+                        .await
+                }
+                MsgKind::Private => self.sender.send_private_msg(msg.user_id, chunk).await,
+            };
+            if let Err(e) = r {
+                self.log(
+                    "warn",
+                    &format!(
+                        "[{}] 发送失败(第 {}/{} 段,共 {} 字): {e}",
+                        session_key(msg),
+                        i + 1,
+                        chunks.len(),
+                        text.chars().count()
+                    ),
+                );
+                return Err(e);
+            }
+            self.emit_msg_out(&session_key(msg), chunk);
+            if i + 1 < chunks.len() {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_msg_in(&self, key: &str, text: &str) {
+        let _ = self.events.try_send(FrontendEvent::MsgIn {
+            key: key.to_string(),
+            text: text.to_string(),
+        });
+    }
+
+    fn emit_msg_out(&self, key: &str, text: &str) {
+        let _ = self.events.try_send(FrontendEvent::MsgOut {
+            key: key.to_string(),
+            text: text.to_string(),
+        });
+    }
+
+    async fn emit_session(&self, key: &str, session: &Session) {
+        let _ = self
+            .events
+            .try_send(FrontendEvent::SessionChanged {
+                key: key.to_string(),
+                count: session.history.len(),
+                tokens: session.total_tokens(),
+            });
+    }
+
+    // ---------- 活跃度与插话 ----------
 
     /// 记录群活跃度(滑动窗口,跨度可配置),同时递增消息计数(插话冷却用)
     fn track_activity(&self, key: &str, window_secs: u64) {
@@ -752,442 +1718,7 @@ impl ChatCore {
         true
     }
 
-    /// 内置斜杠命令,返回 true 表示已处理
-    async fn handle_command(&self, session: &mut Session, msg: &ParsedMsg, text: &str) -> bool {
-        let cfg = self.cfg.read().await;
-        match text {
-            "/clear" => {
-                session.clear();
-                self.emit_session(&session.key, session).await;
-                self.log("info", &format!("[{}] 已清空上下文", session.key));
-                let _ = self
-                    .send_text(msg, "🧹 上下文已清空,重新开始对话。")
-                    .await;
-                true
-            }
-            "/stats" => {
-                let toks = session.total_tokens();
-                self.log(
-                    "info",
-                    &format!(
-                        "[{}] 查看统计: {} 条消息,约 {} tokens",
-                        session.key,
-                        session.history.len(),
-                        toks
-                    ),
-                );
-                let _ = self
-                    .send_text(
-                        msg,
-                        &format!(
-                            "📊 当前会话:{} 条消息,约 {} tokens{}",
-                            session.history.len(),
-                            toks,
-                            session
-                                .summary
-                                .as_ref()
-                                .map(|_| "(含摘要)")
-                                .unwrap_or("")
-                        ),
-                    )
-                    .await;
-                true
-            }
-            _ => {
-                if let Some(rest) = text.strip_prefix("/remember ") {
-                    let content = rest.trim();
-                    if content.is_empty() {
-                        let _ = self.send_text(msg, "用法:/remember <内容>").await;
-                    } else {
-                        session.memory.refresh();
-                        let ok = session.memory.add(
-                            content,
-                            "user",
-                            cfg.chat.memory.max_entries as usize,
-                            cfg.chat.memory.max_entry_chars as usize,
-                        );
-                        let reply_text = if ok {
-                            format!("🧠 已记住: {content}")
-                        } else {
-                            "这条记忆为空或已存在。".to_string()
-                        };
-                        self.log(
-                            "info",
-                            &format!(
-                                "[{}] 用户添加记忆{}: {content}",
-                                session.key,
-                                if ok { "" } else { "(重复或为空)" }
-                            ),
-                        );
-                        let _ = self.send_text(msg, &reply_text).await;
-                    }
-                    true
-                } else if let Some(rest) = text.strip_prefix("/forget ") {
-                    let content = rest.trim();
-                    session.memory.refresh();
-                    // 仅支持英文逗号分隔的数字序号,如 /forget 1,3
-                    let mut idxs: Vec<usize> = Vec::new();
-                    let mut valid = true;
-                    for part in content.split(',') {
-                        let p = part.trim();
-                        if p.is_empty() {
-                            continue;
-                        }
-                        match p.parse::<usize>() {
-                            Ok(i) => idxs.push(i),
-                            Err(_) => {
-                                valid = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !valid || idxs.is_empty() {
-                        let _ = self
-                            .send_text(msg, "用法:/forget <序号,逗号分隔,如 1,3>")
-                            .await;
-                    } else {
-                        idxs.sort_unstable();
-                        idxs.dedup();
-                        // 从大到小删除,避免序号漂移
-                        let mut removed = 0;
-                        for idx in idxs.into_iter().rev() {
-                            if session.memory.remove_index(idx) {
-                                removed += 1;
-                            }
-                        }
-                        let reply_text = if removed > 0 {
-                            format!("🗑️ 已删除 {removed} 条记忆。")
-                        } else {
-                            "未找到匹配的序号。".to_string()
-                        };
-                        self.log(
-                            "info",
-                            &format!(
-                                "[{}] 用户删除记忆: 序号 [{}],删除 {removed} 条",
-                                session.key,
-                                content
-                            ),
-                        );
-                        let _ = self.send_text(msg, &reply_text).await;
-                    }
-                    true
-                } else if text == "/memories" {
-                    session.memory.refresh();
-                    if session.memory.entries.is_empty() {
-                        let _ = self.send_text(msg, "🧠 暂无记忆。").await;
-                    } else {
-                        let scope = if msg.kind == MsgKind::Group {
-                            "本群"
-                        } else {
-                            "本会话"
-                        };
-                        let mut s = format!(
-                            "🧠 {scope}长期记忆({} 条):\n",
-                            session.memory.entries.len()
-                        );
-                        for (i, e) in session.memory.entries.iter().enumerate() {
-                            s.push_str(&format!(
-                                "{}. [{} {}] {}\n",
-                                i + 1,
-                                if e.source == "model" { "自动" } else { "用户" },
-                                crate::memory::fmt_ts(e.ts),
-                                e.text
-                            ));
-                        }
-                        s.push_str("\n💡 添加:/remember <内容> · 删除:/forget <序号,如 1,3>");
-                        self.log(
-                            "info",
-                            &format!("[{}] 查看记忆: {} 条", session.key, session.memory.entries.len()),
-                        );
-                        let _ = self.send_text(msg, &s).await;
-                    }
-                    true
-                } else if text == "/model" {
-                    let list: Vec<String> = cfg.models.iter().map(|m| m.name.clone()).collect();
-                    let _ = self
-                        .send_text(msg, &format!("可用模型: {}", list.join(", ")))
-                        .await;
-                    true
-                } else if let Some(rest) = text.strip_prefix("/model ") {
-                    let name = rest.trim();
-                    if cfg.models.iter().any(|m| m.name == name) {
-                        {
-                            let mut cfg = self.cfg.write().await;
-                            cfg.active_model = name.to_string();
-                        }
-                        let cfg = self.cfg.read().await;
-                        let _ = crate::config::save_config(&self.cfg_path, &cfg);
-                        self.log("info", &format!("[{}] 切换模型 -> {name}", session.key));
-                        let _ = self
-                            .send_text(msg, &format!("✅ 已切换模型: {name}"))
-                            .await;
-                    } else {
-                        let list: Vec<String> = cfg.models.iter().map(|m| m.name.clone()).collect();
-                        let _ = self
-                            .send_text(msg, &format!("❌ 未找到模型 {name},可用: {}", list.join(", ")))
-                            .await;
-                    }
-                    true
-                } else if text == "/prompt" {
-                    let list: Vec<String> = cfg
-                        .prompts
-                        .iter()
-                        .map(|p| format!("{} ({})", p.name, p.id))
-                        .collect();
-                    let _ = self
-                        .send_text(msg, &format!("可用人设: {}", list.join(", ")))
-                        .await;
-                    true
-                } else if let Some(rest) = text.strip_prefix("/prompt ") {
-                    let id = rest.trim();
-                    if cfg.prompts.iter().any(|p| p.id == id) {
-                        {
-                            let mut cfg = self.cfg.write().await;
-                            cfg.active_prompt = id.to_string();
-                        }
-                        let cfg = self.cfg.read().await;
-                        let _ = crate::config::save_config(&self.cfg_path, &cfg);
-                        self.log("info", &format!("[{}] 切换人设 -> {id}", session.key));
-                        let _ = self
-                            .send_text(msg, &format!("✅ 已切换人设: {id}"))
-                            .await;
-                    } else {
-                        let list: Vec<String> = cfg.prompts.iter().map(|p| p.id.clone()).collect();
-                        let _ = self
-                            .send_text(msg, &format!("❌ 未找到人设 {id},可用: {}", list.join(", ")))
-                            .await;
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    /// 上下文预算管理:缓存友好截断 + 可选摘要折叠
-    async fn trim_context(&self, session: &mut Session, user_text: &str) {
-        let (budget, summarize, summarize_tokens, ratio, prompt, mem_cfg, history_target) = {
-            let cfg = self.cfg.read().await;
-            (
-                cfg.chat.context_tokens.saturating_sub(cfg.chat.reserve_tokens) as u64,
-                cfg.chat.summarize,
-                cfg.chat.summarize_tokens,
-                cfg.chat.estimate_ratio,
-                cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default(),
-                cfg.chat.memory.clone(),
-                cfg.chat.history_target_tokens,
-            )
-        };
-        let (prompt_tok, user_tok) = {
-            // 固定前缀 token:人设 + 记忆说明(恒定) + 当前提问
-            let pt = (estimate_tokens(&prompt, ratio) + estimate_tokens(MEMORY_GUIDE, ratio))
-                as u64;
-            (pt, estimate_tokens(user_text, ratio) as u64)
-        };
-        // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
-        let mut mem_tok: u64 = 0;
-        if mem_cfg.enabled {
-            session.memory.refresh();
-            session
-                .memory
-                .trim_to_tokens(mem_cfg.max_tokens.max(64), ratio);
-            mem_tok = session.memory.total_tokens(ratio) as u64;
-        }
-        let mut sum_tok = session.summary_tokens as u64;
-        let hist_tok: u64 = session.history.iter().map(|h| h.tokens as u64).sum();
-
-        // 预算报告(debug):裁剪前的占用明细
-        self.log(
-            "debug",
-            &format!(
-                "[{}] 上下文预算: 人设{prompt_tok} + 记忆{mem_tok} + 摘要{sum_tok} + 历史{hist_tok}({}条) / 总预算 {budget}t",
-                session.key,
-                session.history.len()
-            ),
-        );
-
-        // 摘要与历史共享的预算(输入预算扣除人设、记忆与当前提问)
-        let input_budget = budget.saturating_sub(prompt_tok + mem_tok + user_tok);
-        if input_budget <= sum_tok && session.summary.is_some() {
-            session.summary = None;
-            sum_tok = 0;
-            session.rewrite();
-        }
-        let mut hist_budget = input_budget.saturating_sub(sum_tok);
-        let overflow = hist_tok.saturating_sub(hist_budget);
-
-        // 主动折叠目标:history_target_tokens(>0 时启用,配合记忆 front 策略保持缓存最优)
-        let fold_budget = if history_target > 0 {
-            hist_budget.min(history_target as u64)
-        } else {
-            hist_budget
-        };
-        let need_fold =
-            summarize && session.history.len() > 2 && (hist_tok > fold_budget || overflow > 0);
-        if !need_fold {
-            return;
-        }
-
-        if summarize && session.history.len() > 2 {
-            // 第一轮:把要丢的部分折叠进摘要(预留摘要空间,并至少丢 2 条)
-            let drop = compute_drop(
-                &session.history.iter().map(|h| h.tokens).collect::<Vec<_>>(),
-                fold_budget,
-                1,
-            )
-            .max(2);
-            let dropped: Vec<HistoryMsg> = session.history.drain(..drop).collect();
-            let old_summary = session.summary.clone().unwrap_or_default();
-            let api_msgs: Vec<ApiMessage> = dropped
-                .iter()
-                .map(|h| ApiMessage {
-                    role: h.role.clone(),
-                    content: h.text.clone(),
-                })
-                .collect();
-            let model = self.cfg.read().await.active_model().cloned();
-            if let Some(model) = model {
-                match self
-                    .llm
-                    .summarize(&model, &old_summary, &api_msgs, summarize_tokens)
-                    .await
-                {
-                    Ok(s) => {
-                        session.summary = Some(s.clone());
-                        session.summary_tokens = estimate_tokens(&s, ratio);
-                        session.rewrite();
-                        self.log(
-                            "info",
-                            &format!(
-                                "[{}] 已折叠 {} 条旧消息为摘要",
-                                session.key,
-                                dropped.len()
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        self.log("warn", &format!("[{}] 摘要生成失败: {e}", session.key));
-                        session.summary = None;
-                        session.summary_tokens = 0;
-                        session.rewrite();
-                    }
-                }
-            } else {
-                // 无可用模型:丢弃部分也需落盘,保证磁盘与内存一致
-                session.rewrite();
-                self.log(
-                    "info",
-                    &format!("[{}] 无可用模型,直接丢弃最旧 {} 条消息", session.key, drop),
-                );
-            }
-            sum_tok = session.summary_tokens as u64;
-            hist_budget = budget
-                .saturating_sub(prompt_tok + user_tok)
-                .saturating_sub(sum_tok);
-        }
-
-        // 第二轮:直接头部截断(保证不超预算,只删最旧)
-        let drop = compute_drop(
-            &session.history.iter().map(|h| h.tokens).collect::<Vec<_>>(),
-            hist_budget,
-            0,
-        );
-        if drop > 0 {
-            session.history.drain(..drop);
-            session.rewrite();
-            self.log(
-                "info",
-                &format!("[{}] 上下文超预算,丢弃最旧 {} 条消息", session.key, drop),
-            );
-        }
-    }
-
-    async fn get_session(&self, key: &str) -> Arc<Mutex<Session>> {
-        {
-            let map = self.sessions.read().await;
-            if let Some(s) = map.get(key) {
-                return s.clone();
-            }
-        }
-        let mut map = self.sessions.write().await;
-        map.entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Session::new(key, &self.sessions_dir))))
-            .clone()
-    }
-
-    /// 发送回复(自动分段)
-    async fn send_text(&self, msg: &ParsedMsg, text: &str) -> Result<(), String> {
-        let (max_len, delay) = {
-            let cfg = self.cfg.read().await;
-            (cfg.napcat.max_msg_len.max(1), cfg.napcat.segment_delay_ms)
-        };
-        let chunks: Vec<String> = text
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(max_len)
-            .map(|c| c.iter().collect())
-            .collect();
-        if chunks.len() > 1 {
-            self.log(
-                "info",
-                &format!("[{}] 回复较长,分 {} 段发送", session_key(msg), chunks.len()),
-            );
-        }
-        for (i, chunk) in chunks.iter().enumerate() {
-            let r = match msg.kind {
-                MsgKind::Group => {
-                    self.sender
-                        .send_group_msg(msg.group_id.unwrap_or(0), chunk)
-                        .await
-                }
-                MsgKind::Private => {
-                    self.sender.send_private_msg(msg.user_id, chunk).await
-                }
-            };
-            if let Err(e) = r {
-                self.log(
-                    "warn",
-                    &format!(
-                        "[{}] 发送失败(第 {}/{} 段,共 {} 字): {e}",
-                        session_key(msg),
-                        i + 1,
-                        chunks.len(),
-                        text.chars().count()
-                    ),
-                );
-                return Err(e);
-            }
-            self.emit_msg_out(&session_key(msg), chunk);
-            if i + 1 < chunks.len() {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-        }
-        Ok(())
-    }
-
-    fn emit_msg_in(&self, key: &str, text: &str) {
-        let _ = self.events.try_send(FrontendEvent::MsgIn {
-            key: key.to_string(),
-            text: text.to_string(),
-        });
-    }
-
-    fn emit_msg_out(&self, key: &str, text: &str) {
-        let _ = self.events.try_send(FrontendEvent::MsgOut {
-            key: key.to_string(),
-            text: text.to_string(),
-        });
-    }
-
-    async fn emit_session(&self, key: &str, session: &Session) {
-        let _ = self.events
-            .try_send(FrontendEvent::SessionChanged {
-                key: key.to_string(),
-                count: session.history.len(),
-                tokens: session.total_tokens(),
-            });
-    }
+    // ---------- 对外接口(命令层 / GUI) ----------
 
     /// 会话清理循环:空闲超时移除内存(文件保留)
     pub async fn cleaner_loop(self: Arc<Self>, stop: tokio_util::sync::CancellationToken) {
@@ -1207,6 +1738,10 @@ impl ChatCore {
                             !q.is_empty()
                         });
                         self.activity.lock().unwrap().retain(|_, q| !q.is_empty());
+                        // 状态归位:空闲会话不保留处理中状态
+                        self.status.lock().unwrap().retain(|_, s| {
+                            *s == SessionStatus::Idle
+                        });
                     }
                     let hours = self.cfg.read().await.chat.clean_after_hours;
                     if hours == 0 { continue; }
@@ -1225,6 +1760,7 @@ impl ChatCore {
                         .collect();
                     for k in expired {
                         map.remove(&k);
+                        self.status.lock().unwrap().remove(&k);
                         self.log("info", &format!("[{k}] 会话空闲超过 {hours} 小时,已从内存清理"));
                     }
                 }
@@ -1233,7 +1769,7 @@ impl ChatCore {
     }
 
     /// 供 GUI 使用的会话列表:以磁盘扫描为底(处理中/未加载的会话也能看到),
-    /// 内存会话(锁可拿时)补充 token 与摘要状态。
+    /// 内存会话(锁可拿时)补充 token 与摘要状态,状态灯来自状态表。
     pub async fn session_list(&self) -> Vec<serde_json::Value> {
         let mut list = scan_session_files(&self.sessions_dir);
         // 内存补充(锁可拿时覆盖;拿不到则保持文件数据)
@@ -1250,14 +1786,137 @@ impl ChatCore {
             }
         }
         for item in &mut list {
-            let key = item["key"].as_str().unwrap_or("");
-            if let Some((count, tokens, has_summary)) = mem.get(key) {
+            let key = item["key"].as_str().unwrap_or("").to_string();
+            if let Some((count, tokens, has_summary)) = mem.get(&key) {
                 item["count"] = json!(count);
                 item["tokens"] = json!(tokens);
                 item["has_summary"] = json!(has_summary);
             }
+            item["status"] = json!(self.get_status(&key).as_str());
         }
         list
+    }
+
+    /// 会话详情(轨迹时间线 + 摘要信息);机器人未运行时由命令层直接读盘
+    pub async fn session_detail(&self, key: &str) -> serde_json::Value {
+        let trace_path = self.trace_dir.join(format!("{key}.jsonl"));
+        let events = TraceStore::read_all(&trace_path);
+        let file = self.sessions_dir.join(format!("{key}.jsonl"));
+        let (count, tokens, has_summary, summary) = read_history_summary(&file);
+        json!({
+            "key": key,
+            "status": self.get_status(key).as_str(),
+            "status_label": self.get_status(key).label(),
+            "count": count,
+            "tokens": tokens,
+            "has_summary": has_summary,
+            "summary": summary,
+            "events": events,
+        })
+    }
+
+/// 改写历史文件中某条消息(按 id 匹配,重估 token);返回 Err 表示未找到。
+/// 机器人未运行时命令层也可直接调用(此时无需同步内存会话)。
+pub fn rewrite_history_entry(file: &Path, id: &str, text: &str, ratio: f64) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("内容不能为空".into());
+    }
+    let mut found = false;
+    let mut out = String::new();
+    if let Ok(content) = std::fs::read_to_string(file) {
+        for line in content.lines() {
+            match serde_json::from_str::<HistoryMsg>(line) {
+                Ok(mut h) => {
+                    if h.id == id {
+                        h.text = text.to_string();
+                        h.tokens = estimate_tokens(text, ratio);
+                        found = true;
+                    }
+                    if let Ok(l) = serde_json::to_string(&h) {
+                        out.push_str(&l);
+                        out.push('\n');
+                    }
+                }
+                Err(_) => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    if !found {
+        return Err("未找到该消息(可能已折叠进摘要,仅可查看)".into());
+    }
+    let _ = std::fs::write(file, out);
+    Ok(())
+}
+
+/// 删除历史文件中某条消息(按 id 匹配);返回 Err 表示未找到。
+pub fn remove_history_entry(file: &Path, id: &str) -> Result<(), String> {
+    let mut found = false;
+    let mut out = String::new();
+    if let Ok(content) = std::fs::read_to_string(file) {
+        for line in content.lines() {
+            match serde_json::from_str::<HistoryMsg>(line) {
+                Ok(h) => {
+                    if h.id == id {
+                        found = true;
+                        continue; // 跳过该行 = 删除
+                    }
+                    if let Ok(l) = serde_json::to_string(&h) {
+                        out.push_str(&l);
+                        out.push('\n');
+                    }
+                }
+                Err(_) => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    if !found {
+        return Err("未找到该消息(可能已折叠进摘要)".into());
+    }
+    let _ = std::fs::write(file, out);
+    Ok(())
+}
+
+/// 编辑一条历史消息(同时同步轨迹与内存会话)
+pub async fn update_history_msg(&self, key: &str, id: &str, text: &str) -> Result<(), String> {
+    let ratio = {
+        let cfg = self.cfg.read().await;
+        cfg.chat.estimate_ratio
+    };
+    let file = self.sessions_dir.join(format!("{key}.jsonl"));
+    Self::rewrite_history_entry(&file, id, text, ratio)?;
+    TraceStore::rewrite_text_by_id(&self.trace_dir.join(format!("{key}.jsonl")), id, text);
+    self.reload_session(key).await?;
+    self.log("info", &format!("[{key}] 已改写历史消息 {id}"));
+    Ok(())
+}
+
+/// 删除一条历史消息(同时删除轨迹中对应事件与内存会话)
+pub async fn delete_history_msg(&self, key: &str, id: &str) -> Result<(), String> {
+    let file = self.sessions_dir.join(format!("{key}.jsonl"));
+    Self::remove_history_entry(&file, id)?;
+    TraceStore::remove_by_id(&self.trace_dir.join(format!("{key}.jsonl")), id);
+    self.reload_session(key).await?;
+    self.log("info", &format!("[{key}] 已删除历史消息 {id}"));
+    Ok(())
+}
+
+    /// 停止进行中的回复(存在运行中的流式请求时生效)
+    pub fn stop_session(&self, key: &str) -> bool {
+        match self.aborts.lock().unwrap().get(key) {
+            Some(tx) => {
+                let _ = tx.send(true);
+                self.log("info", &format!("[{key}] 收到停止指令"));
+                true
+            }
+            None => false,
+        }
     }
 
     pub async fn clear_session(&self, key: &str) {
@@ -1267,6 +1926,8 @@ impl ChatCore {
             s.ensure_loaded();
             s.clear();
             self.log("info", &format!("[{key}] 已清空上下文"));
+        } else {
+            self.log("warn", &format!("[{key}] 会话正在回复中,暂无法清空"));
         }
     }
 }
@@ -1338,25 +1999,7 @@ pub fn scan_session_files(dir: &std::path::Path) -> Vec<serde_json::Value> {
                     .to_string_lossy()
                     .trim_end_matches(".jsonl")
                     .to_string();
-                let mut count = 0usize;
-                let mut tokens = 0u64;
-                let mut has_summary = false;
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    for line in content.lines() {
-                        count += 1;
-                        if !has_summary {
-                            if let Ok(h) = serde_json::from_str::<HistoryMsg>(line) {
-                                if h.role == "__summary__" {
-                                    has_summary = true;
-                                    continue;
-                                }
-                            }
-                        }
-                        tokens += serde_json::from_str::<HistoryMsg>(line)
-                            .map(|h| h.tokens as u64)
-                            .unwrap_or(0);
-                    }
-                }
+                let (count, tokens, has_summary, _) = read_history_summary(&path);
                 base.insert(key, (count, tokens, has_summary));
             }
         }
@@ -1466,6 +2109,45 @@ mod tests {
         s3.ensure_loaded();
         assert_eq!(s3.history.len(), 0);
         assert!(s3.summary.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_labels() {
+        assert_eq!(SessionStatus::Idle.as_str(), "idle");
+        assert_eq!(SessionStatus::Thinking.label(), "思考中");
+    }
+
+    #[test]
+    fn history_entry_edit_delete() {
+        let dir = std::env::temp_dir().join("lightbot_test_edit");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("g1.jsonl");
+        let mut s = Session::new("g1", &dir);
+        s.ensure_loaded();
+        s.push_id("user", "你好", 1.0, "id1");
+        s.push_id("assistant", "你好呀", 1.0, "id2");
+        drop(s);
+
+        // 改写
+        ChatCore::rewrite_history_entry(&file, "id1", "改写后的内容", 1.0).unwrap();
+        let (count, _, _, _) = read_history_summary(&file);
+        assert_eq!(count, 2);
+        // 找不到返回 Err
+        assert!(ChatCore::rewrite_history_entry(&file, "不存在", "x", 1.0).is_err());
+
+        // 删除
+        ChatCore::remove_history_entry(&file, "id1").unwrap();
+        let (count, _, _, _) = read_history_summary(&file);
+        assert_eq!(count, 1);
+        assert!(ChatCore::remove_history_entry(&file, "id1").is_err());
+
+        // 重载后内容一致
+        let mut s2 = Session::new("g1", &dir);
+        s2.ensure_loaded();
+        assert_eq!(s2.history.len(), 1);
+        assert_eq!(s2.history[0].text, "你好呀");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

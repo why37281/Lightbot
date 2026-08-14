@@ -11,11 +11,14 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{ChatCore, FrontendEvent};
+use crate::chat::{self, ChatCore, FrontendEvent};
 use crate::config::{self, Config, ModelConfig};
+use crate::cost::CostTracker;
 use crate::llm::LlmClient;
 use crate::memory::MemoryStore;
 use crate::napcat::{BotEvent, ConnStatus, NapcatClient};
+use crate::placement::PlacementController;
+use crate::trace::TraceStore;
 
 // ---------- 应用状态 ----------
 
@@ -32,6 +35,10 @@ pub struct AppState {
     pub restart_lock: tokio::sync::Mutex<()>,
     /// 最近一次连接状态快照(get_status_view 兜底用,不依赖事件链路)
     pub last_status: Arc<Mutex<Option<ConnStatus>>>,
+    /// 用量与费用追踪(机器人停止时 GUI 仍可查询)
+    pub cost: Arc<Mutex<CostTracker>>,
+    /// 记忆位置自动控制状态(机器人停止时审批流程仍可结算)
+    pub placement: Arc<Mutex<PlacementController>>,
 }
 
 pub struct BotHandle {
@@ -67,6 +74,14 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // 用量目录与配置目录同级(应用数据目录)
+    let usage_dir = app
+        .handle()
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("usage");
+
     app.manage(AppState {
         cfg_path,
         sessions_dir,
@@ -76,6 +91,8 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         chat: Mutex::new(None),
         restart_lock: tokio::sync::Mutex::new(()),
         last_status: Arc::new(Mutex::new(None)),
+        cost: Arc::new(Mutex::new(CostTracker::new(usage_dir))),
+        placement: Arc::new(Mutex::new(PlacementController::default())),
     });
     Ok(())
 }
@@ -92,33 +109,7 @@ pub async fn save_config(
     state: tauri::State<'_, AppState>,
     cfg: Config,
 ) -> Result<(), String> {
-    // 校验:至少一个模型且名称唯一
-    if cfg.models.is_empty() {
-        return Err("至少需要一个模型配置".into());
-    }
-    let mut names: Vec<String> = Vec::new();
-    for m in &cfg.models {
-        if m.name.trim().is_empty() {
-            return Err("模型名称不能为空".into());
-        }
-        if names.contains(&m.name) {
-            return Err(format!("模型名称重复: {}", m.name));
-        }
-        names.push(m.name.clone());
-    }
-    if cfg.models.iter().all(|m| m.name != cfg.active_model) {
-        return Err("当前激活模型不在模型列表中".into());
-    }
-    if cfg.prompts.is_empty() {
-        return Err("至少需要一个人设".into());
-    }
-    if cfg.prompts.iter().all(|p| p.id != cfg.active_prompt) {
-        return Err("当前激活人设不在列表中".into());
-    }
-    if cfg.models.iter().any(|m| !(0.0..=2.0).contains(&m.temperature)) {
-        return Err("温度需在 0~2 之间".into());
-    }
-
+    validate_config(&cfg)?;
     config::save_config(&state.cfg_path, &cfg)?;
     *state.config.write().await = cfg;
 
@@ -137,6 +128,35 @@ pub async fn save_config(
                 level: "info".into(),
                 msg: "配置已保存,机器人已按新配置重启".into(),
             });
+    }
+    Ok(())
+}
+
+fn validate_config(cfg: &Config) -> Result<(), String> {
+    if cfg.models.is_empty() {
+        return Err("至少需要一个模型配置".into());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for m in &cfg.models {
+        if m.name.trim().is_empty() {
+            return Err("模型名称不能为空".into());
+        }
+        if names.contains(&m.name) {
+            return Err(format!("模型名称重复: {}", m.name));
+        }
+        if !(0.0..=2.0).contains(&m.temperature) {
+            return Err("温度需在 0~2 之间".into());
+        }
+        names.push(m.name.clone());
+    }
+    if cfg.models.iter().all(|m| m.name != cfg.active_model) {
+        return Err("当前激活模型不在模型列表中".into());
+    }
+    if cfg.prompts.is_empty() {
+        return Err("至少需要一个人设".into());
+    }
+    if cfg.prompts.iter().all(|p| p.id != cfg.active_prompt) {
+        return Err("当前激活人设不在列表中".into());
     }
     Ok(())
 }
@@ -185,6 +205,8 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
         state.sessions_dir.clone(),
         state.cfg_path.clone(),
         state.ev_tx.clone(),
+        state.cost.clone(),
+        state.placement.clone(),
     ));
 
     let mut tasks = Vec::new();
@@ -328,7 +350,7 @@ pub async fn get_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<Value
     match chat {
         Some(c) => Ok(c.session_list().await),
         // 机器人未运行时也返回磁盘会话,列表不再依赖运行状态
-        None => Ok(crate::chat::scan_session_files(&state.sessions_dir)),
+        None => Ok(chat::scan_session_files(&state.sessions_dir)),
     }
 }
 
@@ -341,6 +363,90 @@ pub async fn clear_session(state: tauri::State<'_, AppState>, key: String) -> Re
             Ok(())
         }
         None => Err("机器人未运行".into()),
+    }
+}
+
+/// 会话详情:轨迹时间线 + 摘要信息(机器人未运行时直接读盘)
+#[tauri::command]
+pub async fn get_session_detail(
+    state: tauri::State<'_, AppState>,
+    key: String,
+) -> Result<Value, String> {
+    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(c) = chat {
+        return Ok(c.session_detail(&key).await);
+    }
+    // 未运行:磁盘兜底
+    let trace_path = state.sessions_dir.join("traces").join(format!("{key}.jsonl"));
+    let events = TraceStore::read_all(&trace_path);
+    let file = state.sessions_dir.join(format!("{key}.jsonl"));
+    let (count, tokens, has_summary, summary) = chat::read_history_summary(&file);
+    Ok(serde_json::json!({
+        "key": key,
+        "status": "idle",
+        "count": count,
+        "tokens": tokens,
+        "has_summary": has_summary,
+        "summary": summary,
+        "events": events,
+    }))
+}
+
+/// 编辑一条历史消息(改写上下文,同步轨迹;缓存命中率会受影响——由用户自行权衡)
+#[tauri::command]
+pub async fn update_history_msg(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(c) = chat {
+        return c.update_history_msg(&key, &id, &text).await;
+    }
+    // 机器人未运行:直接改写磁盘(文件为真相,启动后自然生效)
+    let ratio = state.config.read().await.chat.estimate_ratio;
+    let file = state.sessions_dir.join(format!("{key}.jsonl"));
+    ChatCore::rewrite_history_entry(&file, &id, &text, ratio)?;
+    TraceStore::rewrite_text_by_id(
+        &state.sessions_dir.join("traces").join(format!("{key}.jsonl")),
+        &id,
+        &text,
+    );
+    Ok(())
+}
+
+/// 删除一条历史消息(同时删除轨迹中的对应事件)
+#[tauri::command]
+pub async fn delete_history_msg(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    id: String,
+) -> Result<(), String> {
+    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
+    if let Some(c) = chat {
+        return c.delete_history_msg(&key, &id).await;
+    }
+    // 机器人未运行:直接操作磁盘
+    let file = state.sessions_dir.join(format!("{key}.jsonl"));
+    ChatCore::remove_history_entry(&file, &id)?;
+    TraceStore::remove_by_id(
+        &state.sessions_dir.join("traces").join(format!("{key}.jsonl")),
+        &id,
+    );
+    Ok(())
+}
+
+/// 停止进行中的回复(流式请求中止)
+#[tauri::command]
+pub async fn stop_session(
+    state: tauri::State<'_, AppState>,
+    key: String,
+) -> Result<bool, String> {
+    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
+    match chat {
+        Some(c) => Ok(c.stop_session(&key)),
+        None => Ok(false),
     }
 }
 
@@ -384,6 +490,10 @@ pub async fn add_memory(
     store.refresh();
     let added = store.add(&text, "user", mc.max_entries as usize, mc.max_entry_chars as usize);
     if added {
+        // 通知运行中的核心:记忆变更(自动控制评估用)
+        if let Some(c) = state.chat.lock().unwrap().clone() {
+            c.mark_memory_changed();
+        }
         Ok(())
     } else {
         Err("记忆为空或已存在".into())
@@ -403,9 +513,94 @@ pub async fn delete_memory(
     let mut store = MemoryStore::new(path);
     store.refresh();
     if store.remove_index(index) {
+        if let Some(c) = state.chat.lock().unwrap().clone() {
+            c.mark_memory_changed();
+        }
         Ok(())
     } else {
         Err("序号无效".into())
+    }
+}
+
+// ---------- 开销面板 ----------
+
+/// 开销面板数据:今日聚合 + 分类条形图 + 钱包
+#[tauri::command]
+pub async fn get_cost_overview(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let (today, by_category) = {
+        // 作用域内取完即释放 std 锁(锁守卫不可跨 await)
+        let tracker = state.cost.lock().map_err(|e| e.to_string())?;
+        (tracker.today(), tracker.by_category())
+    };
+    let wallet = state.config.read().await.cost.wallet_balance;
+    let remaining = wallet - today.cost;
+    Ok(serde_json::json!({
+        "today": today,
+        "by_category": by_category,
+        "wallet_balance": wallet,
+        "remaining": remaining,
+    }))
+}
+
+// ---------- 记忆位置审批 ----------
+
+/// 当前待审批的切换提案(前端兜底轮询;常规走 PlacementProposal 事件)
+#[tauri::command]
+pub async fn get_placement_proposal(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<Value>, String> {
+    let ctl = state.placement.lock().map_err(|e| e.to_string())?;
+    Ok(ctl.pending.clone().map(|p| serde_json::json!(p)))
+}
+
+/// 审批记忆位置切换提案:approve=true 时落盘切换并保存配置
+#[tauri::command]
+pub async fn approve_placement(
+    state: tauri::State<'_, AppState>,
+    approve: bool,
+) -> Result<Option<String>, String> {
+    // 提案仍与当前方案不同才应用(用户可能已手动改过);锁守卫不可跨 await,先取当前值
+    let current = state.config.read().await.chat.memory.placement.clone();
+    let applied = {
+        let mut ctl = state.placement.lock().map_err(|e| e.to_string())?;
+        let now = crate::trace::now_ts();
+        let applied = if approve {
+            ctl.pending
+                .as_ref()
+                .filter(|p| p.to != current)
+                .map(|p| p.to.clone())
+        } else {
+            None
+        };
+        ctl.settle(now);
+        applied
+    };
+    if let Some(to) = applied {
+        {
+            let mut cfg = state.config.write().await;
+            cfg.chat.memory.placement = to.clone();
+        }
+        {
+            let cfg = state.config.read().await;
+            config::save_config(&state.cfg_path, &cfg)?;
+        }
+        let _ = state.ev_tx.try_send(FrontendEvent::Log {
+            level: "info".into(),
+            msg: format!("记忆位置已切换 -> {to}(自动控制,用户批准)"),
+        });
+        // 机器人运行中:重启使新位置立即生效
+        let _restart_guard = state.restart_lock.lock().await;
+        let old_bot = {
+            let mut guard = state.bot.lock().map_err(|e| e.to_string())?;
+            guard.take()
+        };
+        if let Some(b) = old_bot {
+            b.stop().await;
+            start_bot_inner(&state).await?;
+        }
+        Ok(Some(to))
+    } else {
+        Ok(None)
     }
 }
 

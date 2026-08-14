@@ -551,16 +551,26 @@ impl NapcatClient {
     async fn run_forward(self: Arc<Self>, cancel: CancellationToken) {
         let mut backoff: u64 = 1;
         loop {
-            tokio::select! {
+            let connected = tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = self.clone().connect_once_forward(backoff) => {}
-            }
-            backoff = (backoff * 2).min(30);
+                ok = self.clone().connect_once_forward(backoff) => ok,
+            };
+            // 修复:连接成功后重置退避(历史 bug:长时间在线后断线也要等满 30s);
+            // 成功连接后强制小睡 2s,避免"连上即断"时热循环打爆 NapCat
+            backoff = if connected {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+                1
+            } else {
+                (backoff * 2).min(30)
+            };
         }
     }
 
-    /// 单轮正向连接:连接 -> 运行 -> 断开 -> 等待退避
-    async fn connect_once_forward(self: Arc<Self>, backoff: u64) {
+    /// 单轮正向连接:连接 -> 运行 -> 断开 -> 等待退避;返回是否成功建立过连接
+    async fn connect_once_forward(self: Arc<Self>, backoff: u64) -> bool {
         let url = {
             let cfg = self.cfg.read().await;
             build_ws_url(&cfg)
@@ -572,12 +582,14 @@ impl NapcatClient {
                 self.update_status(true, &url, None, "");
                 let _ = self.clone().run_connection(ws).await;
                 self.update_status(false, &url, None, "连接已断开");
+                true
             }
             Err(e) => {
                 self.update_status(false, &url, None, &format!("连接失败: {e}"));
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                false
             }
         }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
     }
 
     async fn run_reverse(self: Arc<Self>, cancel: CancellationToken) {

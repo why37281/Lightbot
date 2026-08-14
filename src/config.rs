@@ -24,6 +24,8 @@ pub struct Config {
     pub prompts: Vec<PromptPreset>,
     /// 当前激活人设
     pub active_prompt: String,
+    /// 费用与钱包配置(价格随 DeepSeek 官方调价更新,由用户在 GUI 填写)
+    pub cost: CostConfig,
 }
 
 impl Default for Config {
@@ -38,7 +40,23 @@ impl Default for Config {
             chat: ChatConfig::default(),
             prompts: vec![PromptPreset::default()],
             active_prompt: "default".into(),
+            cost: CostConfig::default(),
         }
+    }
+}
+
+/// 费用与钱包:价格随官方调价波动,由用户在 GUI 维护真实值。
+/// 用量按天落盘时记录「当时价格」,历史费用不会因改价而漂移。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct CostConfig {
+    /// 钱包余额(元,用户填写,用于展示剩余额度)
+    pub wallet_balance: f64,
+}
+
+impl Default for CostConfig {
+    fn default() -> Self {
+        Self { wallet_balance: 0.0 }
     }
 }
 
@@ -114,6 +132,12 @@ pub struct ModelConfig {
     pub temperature: f64,
     pub max_tokens: u32,
     pub timeout_secs: u64,
+    /// 输入价格(元 / 1M tokens,未命中缓存)。DeepSeek V4 官方价:flash 1 元 / pro 3 元
+    pub price_input: f64,
+    /// 输入价格(元 / 1M tokens,命中缓存)。DeepSeek V4 官方价:flash 0.02 元 / pro 0.025 元
+    pub price_cache_hit: f64,
+    /// 输出价格(元 / 1M tokens)。DeepSeek V4 官方价:flash 2 元 / pro 6 元
+    pub price_output: f64,
 }
 
 impl ModelConfig {
@@ -129,6 +153,9 @@ impl ModelConfig {
             temperature: 1.0,
             max_tokens: 8192,
             timeout_secs: 120,
+            price_input: 1.0,
+            price_cache_hit: 0.02,
+            price_output: 2.0,
         }
     }
     fn deepseek_v4_pro() -> Self {
@@ -143,6 +170,9 @@ impl ModelConfig {
             temperature: 1.0,
             max_tokens: 8192,
             timeout_secs: 180,
+            price_input: 3.0,
+            price_cache_hit: 0.025,
+            price_output: 6.0,
         }
     }
 }
@@ -176,7 +206,15 @@ pub struct ChatConfig {
     /// 每次触发增加一次轻量模型调用)
     pub decider: bool,
     /// 近期历史主动折叠阈值(token):历史超过该值就折叠进摘要(0 = 仅在超总预算时折叠)
+    /// 仅方案一(记忆在历史后)使用。
     pub history_target_tokens: u32,
+    /// 忽略 * 前缀消息:QQ 消息以 * 开头时,模型不回复、不记入历史(给群友留自由交流空间)
+    pub ignore_star: bool,
+    /// 方案二(摘要→记忆→新历史)的新历史折叠阈值(token):
+    /// 新历史超过该值即把超出「保留条数」的部分摘要进旧历史。
+    pub recent_max_tokens: u32,
+    /// 方案二折叠时至少保留的最近消息条数(超出部分折叠进摘要)
+    pub recent_keep_msgs: u32,
     /// 长期记忆系统配置
     pub memory: MemoryConfig,
     /// 群聊轨迹(未触发消息缓冲)配置
@@ -198,6 +236,9 @@ impl Default for ChatConfig {
             estimate_ratio: 1.15,
             decider: false,
             history_target_tokens: 8192,
+            ignore_star: true,
+            recent_max_tokens: 3000,
+            recent_keep_msgs: 10,
             memory: MemoryConfig::default(),
             trail: TrailConfig::default(),
             interject: InterjectConfig::default(),
@@ -217,11 +258,14 @@ pub struct MemoryConfig {
     pub max_entry_chars: u32,
     /// 记忆总 token 上限(超出删最旧;保护上下文预算)
     pub max_tokens: u32,
-    /// 记忆消息位置:
-    ///  "front" 摘要后/历史前 —— 记忆与历史都命中缓存,但记忆变更会断一次历史;
-    ///  "back"  历史后/提问前 —— 记忆变更不影响历史,但历史增长使记忆每轮 miss。
-    /// 建议配合 history_target_tokens(主动折叠)使用 "front"。
+    /// 记忆消息位置(两种缓存策略,详见 README「记忆位置策略」):
+    ///  "back"  方案一:历史→记忆→提问 —— 记忆每次随历史增长而 miss,适合记忆少/变化频繁;
+    ///  "front" 方案二:摘要→记忆→新历史→提问 —— 记忆稳定命中缓存,适合记忆多/变化少,
+    ///          新历史超过 recent_max_tokens 时折叠进摘要。
     pub placement: String,
+    /// 自动控制:开启后程序按成本模型持续评估两方案,需要切换时弹出醒目审批弹窗,
+    /// 用户批准后才真正切换(带滞回与冷却,避免在分界线附近反复横跳)。
+    pub auto_placement: bool,
 }
 
 impl Default for MemoryConfig {
@@ -232,6 +276,7 @@ impl Default for MemoryConfig {
             max_entry_chars: 200,
             max_tokens: 1200,
             placement: "front".into(),
+            auto_placement: true,
         }
     }
 }

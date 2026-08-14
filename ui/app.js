@@ -1,4 +1,14 @@
 // LightBot 前端逻辑(零构建,Tauri v2 withGlobalTauri)
+//
+// 结构:
+//   1. 工具与全局状态
+//   2. 主题 / 面板切换 / 日志
+//   3. 事件总线(后端 frontend 事件 → 视图)
+//   4. 配置表单绑定与保存 / 模型 / 人设
+//   5. 会话列表(状态胶囊)与记忆管理
+//   6. 总览(缓存统计 + 今日开销面板)
+//   7. 会话详情页(时间线 / 流式直播 / 编辑删除 / 停止)
+//   8. 记忆位置切换审批弹窗
 
 const T = window.__TAURI__;
 const invoke = T ? T.core.invoke : async () => { throw new Error("请在 Tauri 桌面环境中运行"); };
@@ -7,13 +17,17 @@ const listen = T ? T.event.listen : async () => {};
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-// ---------- 全局状态 ----------
-let cfg = null;           // 当前配置副本
-let running = false;      // 机器人运行中
-let stats = { hit: 0, miss: 0, last: null }; // 缓存统计累计
-const logs = [];          // 日志行 {ts, level, msg}
+// ---------- 1. 全局状态 ----------
+let cfg = null;            // 当前配置副本
+let running = false;       // 机器人运行中
+let stats = { hit: 0, miss: 0, last: null }; // 本次运行缓存统计累计
+const logs = [];           // 日志行 {ts, level, msg}
 
-// ---------- 主题(亮/暗切换,记住选择;首次跟随系统) ----------
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ---------- 2. 主题 ----------
 const THEME_KEY = "lightbot-theme";
 
 function applyTheme(t) {
@@ -37,22 +51,23 @@ $("#btn-theme").addEventListener("click", () => {
   applyTheme(t);
 })();
 
-// ---------- 面板切换 ----------
+// ---------- 2b. 面板切换 ----------
+function switchTab(name) {
+  $$("#sidebar nav a").forEach((x) => x.classList.toggle("active", x.dataset.tab === name));
+  $$(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name));
+  if (name === "chat") {
+    refreshSessions();
+    renderMemories();
+  } else if (name === "overview") {
+    refreshCost();
+  }
+}
+
 $$("#sidebar nav a").forEach((a) => {
-  a.addEventListener("click", () => {
-    $$("#sidebar nav a").forEach((x) => x.classList.remove("active"));
-    a.classList.add("active");
-    $$(".tab").forEach((t) => t.classList.remove("active"));
-    $("#tab-" + a.dataset.tab).classList.add("active");
-    // 进入会话设置时主动刷新(不依赖事件链路,事件丢失也能看到最新)
-    if (a.dataset.tab === "chat") {
-      refreshSessions();
-      renderMemories();
-    }
-  });
+  a.addEventListener("click", () => switchTab(a.dataset.tab));
 });
 
-// ---------- 日志 ----------
+// ---------- 2c. 日志 ----------
 function addLog(level, msg) {
   const now = new Date();
   const ts = now.toTimeString().slice(0, 8);
@@ -81,27 +96,15 @@ function renderLogs() {
 $("#log-level").addEventListener("change", renderLogs);
 $("#btn-clear-log").addEventListener("click", () => { logs.length = 0; renderLogs(); });
 
-function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-// ---------- 事件流 ----------
+// ---------- 3. 事件总线 ----------
 listen("frontend", (e) => handleEvent(e.payload));
 
 function handleEvent(ev) {
   switch (ev.type) {
-    case "log":
-      addLog(ev.level, ev.msg);
-      break;
-    case "notice":
-      addLog("notice", `🔔 [${ev.notice_type}] ${ev.desc}`);
-      break;
-    case "msg_in":
-      addLog("msg_in", `← ${ev.key}: ${ev.text}`);
-      break;
-    case "msg_out":
-      addLog("msg_out", `→ ${ev.key}: ${ev.text}`);
-      break;
+    case "log": addLog(ev.level, ev.msg); break;
+    case "notice": addLog("notice", `🔔 [${ev.notice_type}] ${ev.desc}`); break;
+    case "msg_in": addLog("msg_in", `← ${ev.key}: ${ev.text}`); break;
+    case "msg_out": addLog("msg_out", `→ ${ev.key}: ${ev.text}`); break;
     case "llm_stats": {
       const hitRatio = ev.cache_hit + ev.cache_miss > 0
         ? Math.round((ev.cache_hit / (ev.cache_hit + ev.cache_miss)) * 100) : 0;
@@ -113,14 +116,19 @@ function handleEvent(ev) {
         `缓存命中=${ev.cache_hit}t(${hitRatio}%) 未命中=${ev.cache_miss}t` +
         `${ev.reasoning_tokens ? ` 思考=${ev.reasoning_tokens}t` : ""} ${ev.elapsed_ms}ms`);
       renderOverview();
+      scheduleCostRefresh();
       break;
     }
-    case "session_changed":
-      refreshSessions();
+    case "session_changed": refreshSessions(); break;
+    case "status": updateStatusView(ev.status); break;
+    case "session_status": {
+      updateSessionStatusCell(ev.key, ev.status);
+      if (detailState.key === ev.key) setDetailStatus(ev.status);
       break;
-    case "status":
-      updateStatusView(ev.status);
-      break;
+    }
+    case "trace": handleTraceEvent(ev); break;
+    case "turn_delta": handleTurnDelta(ev); break;
+    case "placement_proposal": showApprovalModal(ev.proposal); break;
   }
 }
 
@@ -147,7 +155,7 @@ function renderOverview() {
   $("#ov-last-ms").textContent = stats.last ? `${stats.last.elapsed_ms} ms` : "-";
 }
 
-// ---------- 配置读取与表单绑定 ----------
+// ---------- 4. 配置读取与表单绑定 ----------
 async function loadConfig() {
   cfg = await invoke("get_config");
   bindConfigToForm();
@@ -160,10 +168,16 @@ async function loadConfig() {
   $("#btn-toggle").textContent = running ? "停止" : "启动";
   await refreshSessions();
   await renderMemories();
+  await refreshCost();
+  // 兜底:启动时若有未处理的切换提案(事件可能已错过),弹窗提醒
+  try {
+    const p = await invoke("get_placement_proposal");
+    if (p) showApprovalModal(p);
+  } catch (e) { /* 忽略 */ }
 }
 
 function bindConfigToForm() {
-  const n = cfg.napcat, c = cfg.chat, ij = c.interject;
+  const n = cfg.napcat, c = cfg.chat, ij = c.interject, mem = c.memory;
   $("#cfg-mode").value = n.mode;
   $("#cfg-ws-url").value = n.ws_url;
   $("#cfg-reverse-port").value = n.reverse_port;
@@ -187,6 +201,8 @@ function bindConfigToForm() {
   $("#cfg-summarize-tokens").value = c.summarize_tokens;
   $("#cfg-clean-hours").value = c.clean_after_hours;
   $("#cfg-est-ratio").value = c.estimate_ratio;
+  $("#cfg-ignore-star").checked = c.ignore_star;
+  $("#cfg-wallet").value = cfg.cost.wallet_balance;
   $("#cfg-interject").checked = ij.enabled;
   $("#cfg-interject-mode").value = ij.mode;
   $("#cfg-interject-cooldown").value = ij.cooldown_messages;
@@ -196,11 +212,14 @@ function bindConfigToForm() {
   $("#cfg-soft-at").checked = ij.soft_at_reply;
   $("#cfg-names").value = ij.names;
   $("#cfg-hooks").value = ij.hooks;
-  $("#cfg-memory").checked = c.memory.enabled;
-  $("#cfg-mem-placement").value = c.memory.placement;
-  $("#cfg-mem-max").value = c.memory.max_entries;
-  $("#cfg-mem-chars").value = c.memory.max_entry_chars;
-  $("#cfg-mem-tokens").value = c.memory.max_tokens;
+  $("#cfg-memory").checked = mem.enabled;
+  $("#cfg-mem-placement").value = mem.placement;
+  $("#cfg-mem-auto").checked = mem.auto_placement;
+  $("#cfg-recent-tokens").value = c.recent_max_tokens;
+  $("#cfg-recent-keep").value = c.recent_keep_msgs;
+  $("#cfg-mem-max").value = mem.max_entries;
+  $("#cfg-mem-chars").value = mem.max_entry_chars;
+  $("#cfg-mem-tokens").value = mem.max_tokens;
   $("#cfg-trail").checked = c.trail.enabled;
   $("#cfg-trail-window").value = c.trail.window_minutes;
   $("#cfg-trail-max").value = c.trail.max_entries;
@@ -209,7 +228,7 @@ function bindConfigToForm() {
 }
 
 function collectForm() {
-  const n = cfg.napcat, c = cfg.chat, ij = c.interject;
+  const n = cfg.napcat, c = cfg.chat, ij = c.interject, mem = c.memory;
   n.mode = $("#cfg-mode").value;
   n.ws_url = $("#cfg-ws-url").value.trim();
   n.reverse_port = parseInt($("#cfg-reverse-port").value) || 3005;
@@ -233,6 +252,8 @@ function collectForm() {
   c.summarize_tokens = parseInt($("#cfg-summarize-tokens").value) || 600;
   c.clean_after_hours = parseInt($("#cfg-clean-hours").value) || 0;
   c.estimate_ratio = parseFloat($("#cfg-est-ratio").value) || 1.15;
+  c.ignore_star = $("#cfg-ignore-star").checked;
+  cfg.cost.wallet_balance = parseFloat($("#cfg-wallet").value) || 0;
   ij.enabled = $("#cfg-interject").checked;
   ij.mode = $("#cfg-interject-mode").value;
   ij.cooldown_messages = parseInt($("#cfg-interject-cooldown").value) || 25;
@@ -242,11 +263,14 @@ function collectForm() {
   ij.soft_at_reply = $("#cfg-soft-at").checked;
   ij.names = $("#cfg-names").value.trim();
   ij.hooks = $("#cfg-hooks").value.trim();
-  c.memory.enabled = $("#cfg-memory").checked;
-  c.memory.placement = $("#cfg-mem-placement").value;
-  c.memory.max_entries = parseInt($("#cfg-mem-max").value) || 30;
-  c.memory.max_entry_chars = parseInt($("#cfg-mem-chars").value) || 200;
-  c.memory.max_tokens = parseInt($("#cfg-mem-tokens").value) || 1200;
+  mem.enabled = $("#cfg-memory").checked;
+  mem.placement = $("#cfg-mem-placement").value;
+  mem.auto_placement = $("#cfg-mem-auto").checked;
+  c.recent_max_tokens = parseInt($("#cfg-recent-tokens").value) || 3000;
+  c.recent_keep_msgs = parseInt($("#cfg-recent-keep").value) || 10;
+  mem.max_entries = parseInt($("#cfg-mem-max").value) || 30;
+  mem.max_entry_chars = parseInt($("#cfg-mem-chars").value) || 200;
+  mem.max_tokens = parseInt($("#cfg-mem-tokens").value) || 1200;
   c.trail.enabled = $("#cfg-trail").checked;
   c.trail.window_minutes = parseInt($("#cfg-trail-window").value) || 5;
   c.trail.max_entries = parseInt($("#cfg-trail-max").value) || 10;
@@ -273,6 +297,7 @@ $("#btn-save").addEventListener("click", async () => {
     renderModels();
     renderPrompts();
     renderOverview();
+    refreshCost();
   } catch (e) {
     setResult(String(e), "err");
     addLog("error", "保存配置失败: " + e);
@@ -388,6 +413,9 @@ function renderModels() {
         <label>温度<input data-f="temperature" type="number" step="0.1" min="0" max="2" value="${m.temperature}" /></label>
         <label>max_tokens<input data-f="max_tokens" type="number" min="16" value="${m.max_tokens}" /></label>
         <label>超时(秒)<input data-f="timeout_secs" type="number" min="10" value="${m.timeout_secs}" /></label>
+        <label>输入价·命中缓存(元/1M)<input data-f="price_cache_hit" type="number" step="0.001" min="0" value="${m.price_cache_hit}" /></label>
+        <label>输入价·未命中(元/1M)<input data-f="price_input" type="number" step="0.01" min="0" value="${m.price_input}" /></label>
+        <label>输出价(元/1M)<input data-f="price_output" type="number" step="0.01" min="0" value="${m.price_output}" /></label>
       </div>
       <div class="result test-result" data-i="${i}"></div>`;
     list.appendChild(card);
@@ -404,6 +432,7 @@ function renderModels() {
   list.querySelectorAll(".del-model").forEach((btn) => {
     btn.addEventListener("click", () => {
       const i = parseInt(btn.dataset.i);
+      if (cfg.models.length <= 1) { alert("至少保留一个模型"); return; }
       const removed = cfg.models[i].name;
       cfg.models.splice(i, 1);
       if (cfg.active_model === removed) cfg.active_model = cfg.models[0]?.name || "";
@@ -445,6 +474,9 @@ $("#btn-add-model").addEventListener("click", () => {
     temperature: 1.0,
     max_tokens: 8192,
     timeout_secs: 120,
+    price_input: 1.0,
+    price_cache_hit: 0.02,
+    price_output: 2.0,
   });
   renderModels();
 });
@@ -487,8 +519,9 @@ function renderPrompts() {
     btn.addEventListener("click", () => {
       const i = parseInt(btn.dataset.i);
       if (cfg.prompts.length <= 1) { alert("至少保留一个人设"); return; }
+      const removed = cfg.prompts[i].id;
       cfg.prompts.splice(i, 1);
-      if (cfg.active_prompt === cfg.prompts[i]?.id) cfg.active_prompt = cfg.prompts[0].id;
+      if (cfg.active_prompt === removed) cfg.active_prompt = cfg.prompts[0].id;
       renderPrompts();
     });
   });
@@ -503,7 +536,34 @@ $("#btn-add-prompt").addEventListener("click", () => {
   renderPrompts();
 });
 
-// ---------- 会话列表 ----------
+// ---------- 5. 状态胶囊 ----------
+const STATUS_META = {
+  idle:      { label: "空闲",   cls: "st-idle" },
+  replying:  { label: "回复中", cls: "st-replying" },
+  thinking:  { label: "思考中", cls: "st-thinking" },
+  deciding:  { label: "决策中", cls: "st-deciding" },
+  executing: { label: "执行中", cls: "st-executing" },
+  approval:  { label: "审批中", cls: "st-approval" },
+};
+
+function statusCapsule(status) {
+  const m = STATUS_META[status] || STATUS_META.idle;
+  const span = document.createElement("span");
+  span.className = "capsule " + m.cls;
+  span.textContent = m.label;
+  return span;
+}
+
+function updateSessionStatusCell(key, status) {
+  const row = document.querySelector(`#session-table tbody tr[data-key="${CSS.escape(key)}"]`);
+  if (!row) return;
+  const cell = row.querySelector(".status-cell");
+  if (!cell) return;
+  cell.innerHTML = "";
+  cell.appendChild(statusCapsule(status));
+}
+
+// ---------- 5b. 会话列表 ----------
 async function refreshSessions() {
   const tbody = $("#session-table tbody");
   tbody.innerHTML = "";
@@ -511,24 +571,31 @@ async function refreshSessions() {
   try { list = await invoke("get_sessions"); } catch (e) { /* 未运行 */ }
   for (const s of list) {
     const tr = document.createElement("tr");
+    tr.dataset.key = s.key;
     const kind = s.key.startsWith("g") ? "群" : "私聊";
     tr.innerHTML = `
+      <td class="status-cell"></td>
       <td>${kind} ${escapeHtml(s.key.slice(1))}</td>
       <td>${s.count}</td>
       <td>${s.tokens}</td>
       <td>${s.has_summary ? "✓" : "-"}</td>
       <td><button class="btn small danger clear-session">清空</button></td>`;
-    tr.querySelector(".clear-session").addEventListener("click", async () => {
+    tr.querySelector(".status-cell").appendChild(statusCapsule(s.status || "idle"));
+    // 整行可点开详情页;清空按钮单独处理(不冒泡)
+    tr.addEventListener("click", () => openSessionDetail(s.key));
+    tr.querySelector(".clear-session").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm(`确认清空会话 ${s.key} 的上下文?`)) return;
       try {
         await invoke("clear_session", { key: s.key });
         refreshSessions();
-      } catch (e) { addLog("error", "清空失败: " + e); }
+      } catch (err) { addLog("error", "清空失败: " + err); }
     });
     tbody.appendChild(tr);
   }
 }
 
-// ---------- 记忆管理 ----------
+// ---------- 5c. 记忆管理 ----------
 async function renderMemories() {
   const box = $("#memory-list");
   box.innerHTML = "";
@@ -581,6 +648,385 @@ async function renderMemories() {
 
 $("#btn-refresh-sessions").addEventListener("click", refreshSessions);
 $("#btn-refresh-mem").addEventListener("click", renderMemories);
+
+// ---------- 6. 今日开销面板 ----------
+const CATEGORY_LABELS = {
+  dialogue: "对话",
+  decide: "决策器",
+  summarize: "摘要",
+  interject: "插话",
+};
+
+let costRefreshTimer = null;
+function scheduleCostRefresh() {
+  if (costRefreshTimer) return;
+  costRefreshTimer = setTimeout(() => {
+    costRefreshTimer = null;
+    refreshCost();
+  }, 1200);
+}
+
+async function refreshCost() {
+  let d;
+  try { d = await invoke("get_cost_overview"); } catch (e) { return; }
+  const t = d.today;
+  $("#cost-tokens").textContent = (t.prompt + t.completion).toLocaleString() + " tokens";
+  $("#cost-hit-miss").textContent =
+    `${(t.cache_hit || 0).toLocaleString()} / ${(t.cache_miss || 0).toLocaleString()}`;
+  $("#cost-yuan").textContent = "¥ " + t.cost.toFixed(4);
+  const walletEl = $("#cost-wallet");
+  walletEl.textContent = `¥ ${d.remaining.toFixed(4)}(余额 ¥${d.wallet_balance.toFixed(2)})`;
+  walletEl.classList.toggle("neg", d.remaining < 0);
+
+  // 条形图:按类别展示 命中 / 未命中 / 输出 的堆叠条
+  const box = $("#cost-bars");
+  box.innerHTML = "";
+  const cats = d.by_category || [];
+  const maxTotal = Math.max(1, ...cats.map(([k, v]) => v.cache_hit + v.cache_miss + v.completion));
+  for (const [key, v] of cats) {
+    const label = CATEGORY_LABELS[key] || key;
+    const row = document.createElement("div");
+    row.className = "bar-row";
+    const total = v.cache_hit + v.cache_miss + v.completion;
+    row.innerHTML = `
+      <span class="bar-label">${label}<small>${v.calls} 次 · ¥${v.cost.toFixed(4)}</small></span>
+      <div class="bar-track">
+        <div class="bar-seg hit" style="width:${(v.cache_hit / maxTotal) * 100}%" title="命中 ${v.cache_hit.toLocaleString()}"></div>
+        <div class="bar-seg miss" style="width:${(v.cache_miss / maxTotal) * 100}%" title="未命中 ${v.cache_miss.toLocaleString()}"></div>
+        <div class="bar-seg out" style="width:${(v.completion / maxTotal) * 100}%" title="输出 ${v.completion.toLocaleString()}"></div>
+      </div>
+      <span class="bar-nums">${total.toLocaleString()}t</span>`;
+    box.appendChild(row);
+  }
+  if (!cats.length) {
+    box.innerHTML = '<div class="muted" style="font-size:12px;padding:6px 0">今天还没有模型调用。</div>';
+  }
+}
+
+$("#btn-refresh-cost").addEventListener("click", refreshCost);
+
+// ---------- 7. 会话详情页 ----------
+const detailState = {
+  key: null,
+  turnBlocks: new Map(), // turn -> {el, thinkCard, outCard}
+};
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const pad = (x) => String(x).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function tlCard(kind, title, extraActions = "") {
+  const card = document.createElement("div");
+  card.className = "tl-card tl-" + kind;
+  card.innerHTML = `
+    <div class="tl-head">
+      <span class="tl-title">${title}</span>
+      <span class="spacer"></span>
+      ${extraActions}
+    </div>`;
+  return card;
+}
+
+function tlBody(card, text) {
+  const body = document.createElement("div");
+  body.className = "tl-body";
+  body.textContent = text;
+  card.appendChild(body);
+  return body;
+}
+
+function turnBlock(turn) {
+  let block = detailState.turnBlocks.get(turn);
+  if (!block) {
+    const el = document.createElement("div");
+    el.className = "tl-turn";
+    el.dataset.turn = turn;
+    $("#detail-timeline").appendChild(el);
+    block = { el, thinkCard: null, outCard: null };
+    detailState.turnBlocks.set(turn, block);
+  }
+  return block;
+}
+
+function appendTurnCard(turn, card) {
+  const block = turnBlock(turn);
+  block.el.appendChild(card);
+  return block;
+}
+
+function editButtons(id) {
+  if (!id) return "";
+  return `<button class="btn small tl-edit" data-id="${escapeHtml(id)}">编辑</button>
+          <button class="btn small danger tl-del" data-id="${escapeHtml(id)}">删除</button>`;
+}
+
+function renderDetailEntry(ev) {
+  const timeline = $("#detail-timeline");
+  switch (ev.type) {
+    case "msg_in": {
+      const triggerLabel = { at: "at 触发", reply: "引用回复", keyword: "关键词", private: "私聊", ignored: "★ 忽略", decided_no: "决策器拒绝" }[ev.trigger] || ev.trigger;
+      const card = tlCard(ev.ignored ? "msg-ignored" : "msg-in",
+        `↓ 收到消息 · ${triggerLabel} · ${fmtTime(ev.ts)}`,
+        editButtons(ev.id));
+      tlBody(card, ev.text);
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "cmd": {
+      const card = tlCard("cmd", `⚙ 命令 · ${fmtTime(ev.ts)}`);
+      tlBody(card, ev.text);
+      const rep = document.createElement("div");
+      rep.className = "tl-reply";
+      rep.textContent = ev.reply;
+      card.appendChild(rep);
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "decide": {
+      const card = tlCard(ev.verdict ? "decide-yes" : "decide-no",
+        `⚖ 决策器:${ev.verdict ? "需要回复" : "无需回复"} · ${ev.model} · ${ev.ms}ms · ${fmtTime(ev.ts)}`);
+      tlBody(card, ev.text);
+      card.querySelector(".tl-body").classList.add("collapsible-body");
+      card.querySelector(".tl-title").style.cursor = "pointer";
+      card.querySelector(".tl-title").addEventListener("click", () => {
+        card.querySelector(".tl-body").classList.toggle("folded");
+      });
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "think": {
+      const card = tlCard("think",
+        `💭 思考过程 · ${(ev.tokens || 0).toLocaleString()} tokens · ${fmtTime(ev.ts)}`);
+      const body = tlBody(card, ev.text);
+      body.classList.add("collapsible-body");
+      card.querySelector(".tl-title").style.cursor = "pointer";
+      card.querySelector(".tl-title").addEventListener("click", () => body.classList.toggle("folded"));
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "msg_out": {
+      const u = ev.usage || {};
+      const ratio = u.cache_hit + u.cache_miss > 0 ? Math.round((u.cache_hit / (u.cache_hit + u.cache_miss)) * 100) : 0;
+      const card = tlCard("msg-out",
+        `→ 模型输出(回复) · ${escapeHtml(ev.model)} · ${fmtTime(ev.ts)}`,
+        editButtons(ev.id));
+      tlBody(card, ev.text);
+      const foot = document.createElement("div");
+      foot.className = "tl-foot";
+      foot.textContent = `prompt ${(u.prompt_tokens || 0).toLocaleString()}t · 命中 ${(u.cache_hit || 0).toLocaleString()}t(${ratio}%) · 输出 ${(u.completion_tokens || 0).toLocaleString()}t${u.reasoning_tokens ? ` · 思考 ${u.reasoning_tokens.toLocaleString()}t` : ""}`;
+      card.appendChild(foot);
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "lite_out": {
+      const card = tlCard("lite-out", `💬 主动插话 · ${escapeHtml(ev.model)} · ${fmtTime(ev.ts)}`);
+      tlBody(card, ev.text);
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "fold": {
+      const card = tlCard("fold", `🧾 摘要折叠 · ${ev.folded} 条旧消息 · 摘要 ${(ev.summary_tokens || 0).toLocaleString()}t · ${fmtTime(ev.ts)}`);
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+    case "error": {
+      const card = tlCard("error", `✗ ${escapeHtml(ev.text)} · ${fmtTime(ev.ts)}`);
+      appendTurnCard(ev.turn, card);
+      break;
+    }
+  }
+  timeline.scrollTop = timeline.scrollHeight;
+}
+
+async function openSessionDetail(key) {
+  detailState.key = key;
+  detailState.turnBlocks.clear();
+  $("#session-detail").classList.remove("hidden");
+  const title = key.startsWith("g") ? `群 ${key.slice(1)}` : `私聊 ${key.slice(1)}`;
+  $("#detail-title").textContent = title;
+  $("#detail-timeline").innerHTML = "";
+  let d;
+  try {
+    d = await invoke("get_session_detail", { key });
+  } catch (e) {
+    addLog("error", "加载会话详情失败: " + e);
+    return;
+  }
+  setDetailStatus(d.status);
+  $("#detail-meta").textContent = `${d.count} 条消息 · 约 ${(d.tokens || 0).toLocaleString()} tokens${d.has_summary ? " · 含摘要" : ""}`;
+  const sumBox = $("#detail-summary");
+  if (d.has_summary && d.summary) {
+    sumBox.classList.remove("hidden");
+    sumBox.textContent = "📑 摘要:" + d.summary;
+  } else {
+    sumBox.classList.add("hidden");
+  }
+  for (const ev of d.events || []) {
+    renderDetailEntry(ev);
+  }
+  // 为编辑/删除按钮绑定(渲染后统一绑定)
+  bindDetailActions();
+}
+
+function setDetailStatus(status) {
+  const el = $("#detail-status");
+  el.innerHTML = "";
+  el.appendChild(statusCapsule(status));
+}
+
+function bindDetailActions() {
+  $$("#detail-timeline .tl-edit").forEach((btn) => {
+    if (btn.dataset.bound) return; // 避免直播事件反复追加监听
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const card = btn.closest(".tl-card");
+      const body = card.querySelector(".tl-body");
+      if (!body || body.querySelector("textarea")) return;
+      const original = body.textContent;
+      const ta = document.createElement("textarea");
+      ta.value = original;
+      ta.className = "tl-editarea";
+      const save = document.createElement("button");
+      save.className = "btn small primary";
+      save.textContent = "保存";
+      const cancel = document.createElement("button");
+      cancel.className = "btn small";
+      cancel.textContent = "取消";
+      const wrap = document.createElement("div");
+      wrap.className = "tl-edit-wrap";
+      wrap.appendChild(ta);
+      wrap.appendChild(save);
+      wrap.appendChild(cancel);
+      body.replaceWith(wrap);
+      save.addEventListener("click", async () => {
+        try {
+          await invoke("update_history_msg", { key: detailState.key, id: btn.dataset.id, text: ta.value });
+          addLog("info", "聊天记录已改写");
+          openSessionDetail(detailState.key);
+        } catch (err) { alert("改写失败: " + err); }
+      });
+      cancel.addEventListener("click", () => openSessionDetail(detailState.key));
+    });
+  });
+  $$("#detail-timeline .tl-del").forEach((btn) => {
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm("删除这条聊天记录?(同时从模型上下文中移除)")) return;
+      try {
+        await invoke("delete_history_msg", { key: detailState.key, id: btn.dataset.id });
+        addLog("info", "聊天记录已删除");
+        openSessionDetail(detailState.key);
+      } catch (err) { alert("删除失败: " + err); }
+    });
+  });
+}
+
+$("#btn-detail-back").addEventListener("click", () => {
+  $("#session-detail").classList.add("hidden");
+  detailState.key = null;
+  detailState.turnBlocks.clear();
+});
+
+$("#btn-detail-stop").addEventListener("click", async () => {
+  if (!detailState.key) return;
+  try {
+    const ok = await invoke("stop_session", { key: detailState.key });
+    if (!ok) addLog("warn", "该会话当前没有进行中的回复");
+    else addLog("info", "已发送停止指令");
+  } catch (e) { alert("停止失败: " + e); }
+});
+
+// 直播:完整轨迹事件(新 turn 开始 / 决策 / 最终输出 / 错误)
+function handleTraceEvent(ev) {
+  if (!detailState.key || ev.key !== detailState.key) return;
+  renderDetailEntry(ev.entry);
+  bindDetailActions();
+}
+
+// 直播:思考/正文增量(流式,QQ 侧并非流式,详情页直播)
+function handleTurnDelta(ev) {
+  if (!detailState.key || ev.key !== detailState.key) return;
+  const block = turnBlock(ev.turn);
+  if (ev.kind === "think") {
+    if (!block.thinkCard) {
+      const card = tlCard("think", "💭 思考过程(进行中)");
+      const body = tlBody(card, "");
+      body.classList.add("collapsible-body");
+      card.querySelector(".tl-title").style.cursor = "pointer";
+      card.querySelector(".tl-title").addEventListener("click", () => body.classList.toggle("folded"));
+      block.el.appendChild(card);
+      block.thinkCard = { card, body };
+    }
+    block.thinkCard.body.textContent += ev.text;
+  } else if (ev.kind === "out") {
+    if (!block.outCard) {
+      const card = tlCard("msg-out", "→ 模型输出(回复,进行中)");
+      const body = tlBody(card, "");
+      block.el.appendChild(card);
+      block.outCard = { card, body };
+    }
+    block.outCard.body.textContent += ev.text;
+  }
+  $("#detail-timeline").scrollTop = $("#detail-timeline").scrollHeight;
+}
+
+// ---------- 8. 记忆位置切换审批弹窗 ----------
+function showApprovalModal(p) {
+  const name = { front: "方案二(摘要→记忆→新历史→提问)", back: "方案一(历史→记忆→提问)" };
+  const body = $("#approval-body");
+  body.innerHTML = "";
+  const info = document.createElement("div");
+  info.className = "approval-info";
+  info.innerHTML = `
+    <p><b>建议从</b> ${escapeHtml(name[p.from] || p.from)}
+       <b>切换到</b> ${escapeHtml(name[p.to] || p.to)}</p>
+    <p class="approval-reason">${escapeHtml(p.reason || "")}</p>
+    <div class="approval-nums">
+      <span>每轮节省 <b>¥${(p.saving_per_round / 1e6).toFixed(6)}</b></span>
+      <span>一次性切换成本 <b>¥${(p.switch_cost / 1e6).toFixed(4)}</b></span>
+      <span>展望 ${p.horizon} 轮净省 <b>¥${(p.expected_saving / 1e6).toFixed(2)}</b></span>
+    </div>
+    <p class="muted" style="font-size:12px">切换会立即重启机器人并导致一次大范围缓存未命中;批准后 24 小时内不再提出新的切换。</p>`;
+  body.appendChild(info);
+  $("#approval-modal").classList.remove("hidden");
+}
+
+$("#btn-approve-yes").addEventListener("click", async () => {
+  try {
+    const applied = await invoke("approve_placement", { approve: true });
+    $("#approval-modal").classList.add("hidden");
+    addLog("info", applied ? `已切换到记忆位置策略: ${applied}` : "提案已过期,未切换");
+    if (applied) {
+      cfg.chat.memory.placement = applied;
+      $("#cfg-mem-placement").value = applied;
+      // 重启后刷新状态
+      setTimeout(async () => {
+        try {
+          const sv = await invoke("get_status_view");
+          running = sv.running;
+          $("#btn-toggle").textContent = running ? "停止" : "启动";
+          updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error });
+        } catch (e) { /* 忽略 */ }
+      }, 1200);
+    }
+  } catch (e) {
+    alert("切换失败: " + e);
+  }
+});
+
+$("#btn-approve-no").addEventListener("click", async () => {
+  $("#approval-modal").classList.add("hidden");
+  try {
+    await invoke("approve_placement", { approve: false });
+    addLog("info", "已拒绝切换提案,进入 24 小时冷却");
+  } catch (e) { /* 忽略 */ }
+});
 
 // ---------- 初始化 ----------
 loadConfig().catch((e) => {

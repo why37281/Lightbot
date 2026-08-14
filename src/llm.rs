@@ -1,13 +1,21 @@
 //! OpenAI 兼容 LLM 客户端(DeepSeek / 通义 / OpenAI 等)。
-//! 重点采集 usage 中的 prompt_cache_hit_tokens / prompt_cache_miss_tokens,
-//! 用于在 GUI 展示上下文缓存命中率(DeepSeek 自动 context caching)。
+//!
+//! - 完整对话走 **流式(SSE)**:思考/正文增量实时上抛(会话详情页直播、状态灯、思考提示计时),
+//!   请求可被用户中止;
+//! - 决策 / 摘要 / 连通测试走非流式(小请求,无需直播);
+//! - 采集 usage 中的 prompt_cache_hit_tokens / prompt_cache_miss_tokens 用于缓存命中率展示。
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use crate::config::ModelConfig;
+
+/// 用户主动停止的固定错误文案(chat.rs 据此决定不向 QQ 发送错误)
+pub const USER_STOPPED: &str = "用户已停止本次回复";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ApiMessage {
@@ -23,7 +31,7 @@ pub struct Usage {
     pub cache_hit: u64,
     /// 未命中缓存的 token
     pub cache_miss: u64,
-    /// 思维链 token 数(DeepSeek V4 思考模式: completion_tokens_details.reasoning_tokens)
+    /// 思维链 token 数(DeepSeek 思考模式: completion_tokens_details.reasoning_tokens)
     pub reasoning_tokens: u64,
 }
 
@@ -42,7 +50,7 @@ impl Usage {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LlmReply {
     pub text: String,
-    /// 推理模型的思考内容(reasoning_content),单独返回便于前端展示
+    /// 推理模型的思考内容(reasoning_content)
     pub reasoning: String,
     pub usage: Usage,
 }
@@ -56,14 +64,71 @@ impl LlmClient {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
+                .timeout(Duration::from_secs(600))
                 .build()
                 .expect("failed to build http client"),
         }
     }
 
-    /// 非流式对话补全。messages 应已按缓存友好顺序排好:
-    /// [system(人设), system(摘要)?, 历史..., 当前提问]
+    /// 构造请求体(流式/非流式共用;修复历史 bug:max_tokens 应为 min 而非 max,
+    /// 否则每次请求都按模型上限申请输出,突破回复预留)
+    fn build_body(
+        m: &ModelConfig,
+        messages: &[ApiMessage],
+        max_tokens: Option<u32>,
+        stream: bool,
+    ) -> Value {
+        let mut body = json!({
+            "model": m.model,
+            "messages": messages,
+            "stream": stream,
+        });
+        // DeepSeek V4:思考模式由 thinking 参数切换(默认开启),思考模式下不支持 temperature
+        // 非 DeepSeek 模型不发送 thinking 参数,保持通用兼容
+        let is_deepseek = m.model.to_lowercase().contains("deepseek");
+        if is_deepseek && m.thinking != "disabled" {
+            body["thinking"] = json!({ "type": "enabled" });
+            if !m.reasoning_effort.is_empty() {
+                body["reasoning_effort"] = json!(m.reasoning_effort);
+            }
+        } else {
+            body["temperature"] = json!(m.temperature);
+            if is_deepseek && m.thinking == "disabled" {
+                body["thinking"] = json!({ "type": "disabled" });
+            }
+        }
+        if let Some(t) = max_tokens {
+            body["max_tokens"] = json!(t.min(m.max_tokens));
+        }
+        body
+    }
+
+    fn parse_reply(v: &Value, raw: &str) -> Result<LlmReply, String> {
+        let choice = &v["choices"][0];
+        let msg = &choice["message"];
+        let text = msg["content"].as_str().unwrap_or("").trim().to_string();
+        let reasoning = msg["reasoning_content"].as_str().unwrap_or("").trim().to_string();
+        if text.is_empty() && reasoning.is_empty() {
+            return Err(format!("模型返回空内容: {}", truncate(raw, 300)));
+        }
+        let usage = Usage {
+            prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            cache_hit: v["usage"]["prompt_cache_hit_tokens"].as_u64().unwrap_or(0),
+            cache_miss: v["usage"]["prompt_cache_miss_tokens"].as_u64().unwrap_or(0),
+            reasoning_tokens: v["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+        };
+        Ok(LlmReply {
+            text,
+            reasoning,
+            usage,
+        })
+    }
+
+    /// 非流式对话补全(决策/摘要/连通测试用)。
+    /// messages 应已按缓存友好顺序排好。
     pub async fn chat(
         &self,
         m: &ModelConfig,
@@ -71,29 +136,7 @@ impl LlmClient {
         max_tokens: Option<u32>,
     ) -> Result<LlmReply, String> {
         let url = format!("{}/chat/completions", m.base_url.trim_end_matches('/'));
-        let mut body = json!({
-            "model": m.model,
-            "messages": messages,
-            "stream": false,
-        });
-        // DeepSeek V4:思考模式由 thinking 参数切换(默认开启),思考模式下不支持 temperature
-        // 非 DeepSeek 模型不发送 thinking 参数,保持通用兼容
-        let is_deepseek = m.model.to_lowercase().contains("deepseek");
-        if is_deepseek && m.thinking != "disabled" {
-            body["thinking"] = json!({"type": "enabled"});
-            if !m.reasoning_effort.is_empty() {
-                body["reasoning_effort"] = json!(m.reasoning_effort);
-            }
-        } else {
-            body["temperature"] = json!(m.temperature);
-            if is_deepseek && m.thinking == "disabled" {
-                body["thinking"] = json!({"type": "disabled"});
-            }
-        }
-        if let Some(t) = max_tokens {
-            body["max_tokens"] = json!(t.max(m.max_tokens));
-        }
-
+        let body = Self::build_body(m, messages, max_tokens, false);
         let timeout = Duration::from_secs(m.timeout_secs.max(10));
         let resp = self
             .http
@@ -111,33 +154,54 @@ impl LlmClient {
         if !status.is_success() {
             return Err(format!("HTTP {status}: {}", truncate(&text, 300)));
         }
-
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| format!("响应解析失败: {e}\n{}", truncate(&text, 300)))?;
+        Self::parse_reply(&v, &text)
+    }
 
-        let choice = &v["choices"][0];
-        let msg = &choice["message"];
-        let text = msg["content"].as_str().unwrap_or("").trim().to_string();
-        let reasoning = msg["reasoning_content"].as_str().unwrap_or("").trim().to_string();
+    /// 流式对话补全(完整通道)。返回后可逐事件驱动,期间响应 cancel 通道。
+    pub async fn chat_stream(
+        &self,
+        m: &ModelConfig,
+        messages: &[ApiMessage],
+        max_tokens: Option<u32>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<StreamedChat, String> {
+        let url = format!("{}/chat/completions", m.base_url.trim_end_matches('/'));
+        let mut body = Self::build_body(m, messages, max_tokens, true);
+        // 请求在最后一个数据块返回 usage(OpenAI 兼容惯例;DeepSeek 默认也会返回)
+        body["stream_options"] = json!({ "include_usage": true });
+        let timeout = Duration::from_secs(m.timeout_secs.max(10));
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(timeout)
+            .bearer_auth(m.api_key.trim())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("请求失败: {e}"))?;
 
-        if text.is_empty() && reasoning.is_empty() {
-            return Err(format!("模型返回空内容: {}", truncate(&text, 300)));
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| String::new());
+            return Err(format!("HTTP {status}: {}", truncate(&text, 300)));
         }
-
-        let usage = Usage {
-            prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-            cache_hit: v["usage"]["prompt_cache_hit_tokens"].as_u64().unwrap_or(0),
-            cache_miss: v["usage"]["prompt_cache_miss_tokens"].as_u64().unwrap_or(0),
-            reasoning_tokens: v["usage"]["completion_tokens_details"]["reasoning_tokens"]
-                .as_u64()
-                .unwrap_or(0),
-        };
-
-        Ok(LlmReply {
-            text,
-            reasoning,
-            usage,
+        Ok(StreamedChat {
+            stream: Box::pin(
+                resp.bytes_stream()
+                    .map(|r| r.map_err(|e| format!("流式读取失败: {e}"))),
+            ),
+            buffer: String::new(),
+            cancel,
+            text: String::new(),
+            reasoning: String::new(),
+            usage: Usage::default(),
+            pending_content: None,
         })
     }
 
@@ -158,14 +222,15 @@ impl LlmClient {
         ))
     }
 
-    /// 用当前模型把一批旧消息压缩成摘要(缓存友好折叠,非思考模式)
+    /// 用当前模型把一批旧消息压缩成摘要(缓存友好折叠,非思考模式)。
+    /// 返回(摘要文本, usage) —— usage 供费用追踪。
     pub async fn summarize(
         &self,
         m: &ModelConfig,
         old_summary: &str,
         dropped: &[ApiMessage],
         max_tokens: u32,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Usage), String> {
         let mut content = String::from("请把下面的对话历史压缩成简洁的要点摘要,保留:关键事实、用户的偏好与要求、尚未完成的事项、对话主题。只输出摘要本身。\n\n");
         if !old_summary.is_empty() {
             content.push_str("【已有摘要】\n");
@@ -188,13 +253,19 @@ impl LlmClient {
             .chat(&m2, &msgs, Some(max_tokens.max(64)))
             .await
             .map_err(|e| format!("摘要生成失败: {e}"))?;
-        Ok(reply.text)
+        Ok((reply.text, reply.usage))
     }
 
     /// 决策请求:判断这条消息是否需要回复。
     /// 用当前模型,但强制关闭思考模式、极小输出(16 tokens),开销接近一次 ping。
     /// 上下文只带人设 + 当前消息,不带历史(决策只看当下值不值得回)。
-    pub async fn decide(&self, m: &ModelConfig, prompt: &str, text: &str) -> Result<bool, String> {
+    /// 返回(结论, usage)。
+    pub async fn decide(
+        &self,
+        m: &ModelConfig,
+        prompt: &str,
+        text: &str,
+    ) -> Result<(bool, Usage), String> {
         let mut m2 = m.clone();
         m2.thinking = "disabled".into();
         m2.max_tokens = 16;
@@ -214,7 +285,132 @@ impl LlmClient {
             },
         ];
         let reply = self.chat(&m2, &msgs, Some(16)).await?;
-        Ok(parse_decision(&reply.text))
+        Ok((parse_decision(&reply.text), reply.usage))
+    }
+}
+
+/// 流式响应的增量事件
+pub enum StreamEvent {
+    /// 思考增量(reasoning_content)
+    Reasoning { delta: String },
+    /// 正文增量(content)
+    Content { delta: String },
+}
+
+/// 流式响应驱动器:逐事件产出增量,累积全文与 usage。
+pub struct StreamedChat {
+    stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, String>> + Send>,
+    >,
+    buffer: String,
+    cancel: watch::Receiver<bool>,
+    text: String,
+    reasoning: String,
+    usage: Usage,
+    /// 同一 delta 中 reasoning 与 content 并存时暂存的正文增量
+    pending_content: Option<String>,
+}
+
+impl StreamedChat {
+    /// 下一个增量事件;None 表示流结束(用 finish() 取全文)。
+    pub async fn next_event(&mut self) -> Option<Result<StreamEvent, String>> {
+        use futures_util::StreamExt;
+        loop {
+            if *self.cancel.borrow() {
+                return Some(Err(USER_STOPPED.into()));
+            }
+            if let Some(c) = self.pending_content.take() {
+                self.text.push_str(&c);
+                return Some(Ok(StreamEvent::Content { delta: c }));
+            }
+            // 缓冲区里已有完整行则先消费
+            if let Some(pos) = self.buffer.find('\n') {
+                let line: String = self.buffer.drain(..=pos).collect();
+                let line = line.trim();
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        return None;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        if let Some(ev) = self.apply_chunk(&v) {
+                            return Some(Ok(ev));
+                        }
+                    }
+                    // 无增量的块(如仅含 usage)继续读下一行
+                }
+                continue;
+            }
+            // 拉取下一段网络数据
+            let chunk = self.stream.next().await?;
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => return Some(Err(e)),
+            };
+            self.buffer.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    /// 应用一个 data 块:累积增量与 usage,返回增量事件(如有)
+    fn apply_chunk(&mut self, v: &Value) -> Option<StreamEvent> {
+        let delta = &v["choices"][0]["delta"];
+        if let Some(usage) = v["usage"].as_object() {
+            self.usage = Usage {
+                prompt_tokens: usage
+                    .get("prompt_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                completion_tokens: usage
+                    .get("completion_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                cache_hit: usage
+                    .get("prompt_cache_hit_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                cache_miss: usage
+                    .get("prompt_cache_miss_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                reasoning_tokens: usage
+                    .get("completion_tokens_details")
+                    .and_then(|x| x.get("reasoning_tokens"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+            };
+        }
+        if let Some(r) = delta["reasoning_content"].as_str() {
+            if !r.is_empty() {
+                self.reasoning.push_str(r);
+                // 同一 delta 中可能同时带正文增量:先存起来,下轮返回,绝不丢弃
+                if let Some(c) = delta["content"].as_str() {
+                    if !c.is_empty() {
+                        self.pending_content = Some(c.to_string());
+                    }
+                }
+                return Some(StreamEvent::Reasoning {
+                    delta: r.to_string(),
+                });
+            }
+        }
+        if let Some(c) = delta["content"].as_str() {
+            if !c.is_empty() {
+                self.text.push_str(c);
+                return Some(StreamEvent::Content {
+                    delta: c.to_string(),
+                });
+            }
+        }
+        None
+    }
+
+    /// 取最终结果(应在 next_event 返回 None 后调用)
+    pub fn finish(self) -> LlmReply {
+        LlmReply {
+            text: self.text.trim().to_string(),
+            reasoning: self.reasoning.trim().to_string(),
+            usage: self.usage,
+        }
     }
 }
 
@@ -241,6 +437,78 @@ mod tests {
         assert!(parse_decision(""));
         assert!(parse_decision("我不知道"));
         assert!(parse_decision("  Y  "));
+    }
+
+    #[test]
+    fn max_tokens_is_capped() {
+        let mut m = ModelConfig::default();
+        m.max_tokens = 8192;
+        let body = LlmClient::build_body(
+            &m,
+            &[ApiMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            Some(1024),
+            false,
+        );
+        assert_eq!(body["max_tokens"], 1024);
+        // 请求值超过模型上限时封顶到模型上限
+        let body2 = LlmClient::build_body(
+            &m,
+            &[ApiMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            Some(20000),
+            false,
+        );
+        assert_eq!(body2["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn sse_chunks_applied() {
+        let (_tx, rx) = watch::channel(false);
+        // 直接测 apply_chunk 逻辑
+        let mut sc = StreamedChat {
+            stream: Box::pin(futures_util::stream::empty()),
+            buffer: String::new(),
+            cancel: rx,
+            text: String::new(),
+            reasoning: String::new(),
+            usage: Usage::default(),
+            pending_content: None,
+        };
+        let v = serde_json::json!({
+            "choices": [{"delta": {"reasoning_content": "想", "content": ""}}]
+        });
+        match sc.apply_chunk(&v) {
+            Some(StreamEvent::Reasoning { delta }) => assert_eq!(delta, "想"),
+            _ => panic!("应为思考增量"),
+        }
+        let v2 = serde_json::json!({
+            "choices": [{"delta": {"content": "你好"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10,
+                      "prompt_cache_hit_tokens": 90, "prompt_cache_miss_tokens": 10}
+        });
+        match sc.apply_chunk(&v2) {
+            Some(StreamEvent::Content { delta }) => assert_eq!(delta, "你好"),
+            _ => panic!("应为正文增量"),
+        }
+        assert_eq!(sc.usage.prompt_tokens, 100);
+        assert_eq!(sc.usage.cache_hit, 90);
+        assert_eq!(sc.reasoning, "想");
+        assert_eq!(sc.text, "你好");
+
+        // 同一 delta 同时含思考与正文:正文不得丢失(暂存待下轮)
+        let v3 = serde_json::json!({
+            "choices": [{"delta": {"reasoning_content": "再想", "content": "接着写"}}]
+        });
+        match sc.apply_chunk(&v3) {
+            Some(StreamEvent::Reasoning { delta }) => assert_eq!(delta, "再想"),
+            _ => panic!("应为思考增量"),
+        }
+        assert_eq!(sc.pending_content.as_deref(), Some("接着写"));
     }
 }
 
