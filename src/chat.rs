@@ -513,7 +513,16 @@ impl ChatCore {
         // ① 被动触发(@/回复/关键词/私聊)→ 完整通道
         if trigger::passive_hit(&cfg, &msg) {
             drop(cfg);
-            if self.decider_ok(&key, &turn, &msg.text).await {
+            let hint = if msg.at_me {
+                "对方 @ 了你"
+            } else if msg.reply_me {
+                "对方引用回复了你的消息"
+            } else if msg.kind == MsgKind::Private {
+                "这是发给你的私聊消息"
+            } else {
+                "消息包含触发关键词"
+            };
+            if self.decider_ok(&key, &turn, &msg.text, hint).await {
                 self.full_dialogue(&key, &msg, &turn).await;
             } else {
                 self.log("info", &format!("[{key}] 决策器:无需回复(被动触发)"));
@@ -534,7 +543,7 @@ impl ChatCore {
         // ② 软 at(提到机器人称呼)→ 完整通道,必回,刷新插话冷却(决策器通过才回复)
         if msg.kind == MsgKind::Group && trigger::soft_at_hit(&cfg, &msg.text) {
             drop(cfg);
-            if self.decider_ok(&key, &turn, &msg.text).await {
+            if self.decider_ok(&key, &turn, &msg.text, "消息提到了你的称呼").await {
                 self.mark_interjected(&key);
                 self.log("info", &format!("[{key}] 软 at 触发(称呼提及)"));
                 self.full_dialogue(&key, &msg, &turn).await;
@@ -552,7 +561,7 @@ impl ChatCore {
             drop(cfg);
             // 插话消息未进历史,记录到轨迹
             self.record_trail(&key, &msg.text).await;
-            if self.decider_ok(&key, &turn, &user_text).await {
+            if self.decider_ok(&key, &turn, &user_text, "主动插话采样命中(是否接话)").await {
                 self.log("info", &format!("[{key}] 主动插话: {user_text}"));
                 self.light_reply(&msg, &user_text, &turn).await;
             } else {
@@ -603,7 +612,8 @@ impl ChatCore {
 
     /// 决策器:开启时由当前模型判断这条消息是否需要回复。
     /// 关闭 / 无模型 / 决策调用失败 → 按需要回复处理(保守,不漏回消息)。
-    async fn decider_ok(&self, key: &str, turn: &str, text: &str) -> bool {
+    /// trigger_hint 说明消息的触发方式(修复:决策器此前看不到 @ 信息,把召唤消息误判为闲聊)
+    async fn decider_ok(&self, key: &str, turn: &str, text: &str, trigger_hint: &str) -> bool {
         let (enabled, model, prompt) = {
             let cfg = self.cfg.read().await;
             (
@@ -620,7 +630,7 @@ impl ChatCore {
         };
         self.set_status(key, SessionStatus::Deciding);
         let started = Instant::now();
-        let result = self.llm.decide(&model, &prompt, text).await;
+        let result = self.llm.decide(&model, &prompt, text, trigger_hint).await;
         self.set_status(key, SessionStatus::Idle);
         let ms = started.elapsed().as_millis() as u64;
         match result {
@@ -641,7 +651,7 @@ impl ChatCore {
                 self.log(
                     "info",
                     &format!(
-                        "决策器: {}这条消息 ({}ms)",
+                        "决策器[{trigger_hint}]: {}这条消息 ({}ms)",
                         if yes { "需要回复" } else { "无需回复" },
                         ms
                     ),
