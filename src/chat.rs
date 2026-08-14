@@ -358,6 +358,8 @@ pub struct ChatCore {
     pub status: StdMutex<HashMap<String, SessionStatus>>,
     /// 进行中回复的中止通道(key -> sender)
     pub aborts: StdMutex<HashMap<String, watch::Sender<bool>>>,
+    /// 会话忙碌时暂存的消息队列(key -> (消息, turn)),回合结束后按序补处理
+    pub pending_msgs: StdMutex<HashMap<String, VecDeque<(ParsedMsg, String)>>>,
     /// 进行中回复的直播缓冲(key -> 已累计思考/正文;轮询兜底用)
     pub live: StdMutex<HashMap<String, LiveTurn>>,
     /// 费用追踪(与命令层共享)
@@ -396,6 +398,7 @@ impl ChatCore {
             trail: StdMutex::new(HashMap::new()),
             status: StdMutex::new(HashMap::new()),
             aborts: StdMutex::new(HashMap::new()),
+            pending_msgs: StdMutex::new(HashMap::new()),
             live: StdMutex::new(HashMap::new()),
             cost,
             placement,
@@ -716,10 +719,11 @@ impl ChatCore {
 
     /// 完整通道:会话级对话(命令 / 上下文预算 / 历史 / 落盘)
     async fn full_dialogue(&self, key: &str, msg: &ParsedMsg, turn: &str) {
-        // 会话内串行:busy 时忽略(日志记录)
+        // 会话内串行:busy 时排队而非丢弃(热闹群里 @ 消息不丢失,回合结束按序补处理)
         let sess = self.get_session(key).await;
         let Ok(mut session) = sess.try_lock() else {
-            self.log("warn", &format!("[{key}] 上一条消息仍在处理,忽略本条"));
+            self.queue_pending(key, msg.clone(), turn.to_string());
+            self.log("info", &format!("[{key}] 上一条消息仍在处理,本条已排队"));
             return;
         };
         session.ensure_loaded();
@@ -743,6 +747,8 @@ impl ChatCore {
                     },
                 )
                 .await;
+                drop(session);
+                self.drain_queue(key).await;
                 return;
             }
         }
@@ -753,6 +759,8 @@ impl ChatCore {
             trigger::strip_keyword(text, &cfg.napcat.keyword).to_string()
         };
         if user_text.is_empty() {
+            drop(session);
+            self.drain_queue(key).await;
             return;
         }
 
@@ -778,6 +786,8 @@ impl ChatCore {
         };
         let Some(model) = model else {
             self.log("error", "未配置可用模型");
+            drop(session);
+            self.drain_queue(key).await;
             return;
         };
 
@@ -942,6 +952,43 @@ impl ChatCore {
                     let _ = self.send_text(msg, &format!("⚠️ 出错了: {e}")).await;
                 }
             }
+        }
+        // 释放会话锁后补处理排队消息(排队消息的决策器在到达时已运行)
+        drop(session);
+        self.drain_queue(key).await;
+    }
+
+    /// 忙碌时入队(上限 8 条,超出丢最旧,防无限堆积)
+    fn queue_pending(&self, key: &str, msg: ParsedMsg, turn: String) {
+        let mut m = self.pending_msgs.lock().unwrap();
+        let q = m.entry(key.to_string()).or_default();
+        if q.len() >= 8 {
+            q.pop_front();
+        }
+        q.push_back((msg, turn));
+    }
+
+    /// 逐条补处理排队消息(full_dialogue 结束处调用;嵌套调用自然处理新增排队)
+    async fn drain_queue(&self, key: &str) {
+        loop {
+            let next = {
+                let mut m = self.pending_msgs.lock().unwrap();
+                m.get_mut(key).and_then(|q| q.pop_front())
+            };
+            let Some((msg, turn)) = next else { return; };
+            let sess = self.get_session(key).await;
+            if sess.try_lock().is_err() {
+                // 理论不应发生(锁已释放);放回队首,留待下次
+                self.pending_msgs
+                    .lock()
+                    .unwrap()
+                    .entry(key.to_string())
+                    .or_default()
+                    .push_front((msg, turn));
+                return;
+            }
+            // Box::pin 打断 async 递归的类型膨胀(full_dialogue → drain_queue → full_dialogue)
+            Box::pin(self.full_dialogue(key, &msg, &turn)).await;
         }
     }
 

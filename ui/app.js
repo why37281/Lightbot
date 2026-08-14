@@ -97,7 +97,9 @@ $("#log-level").addEventListener("change", renderLogs);
 $("#btn-clear-log").addEventListener("click", () => { logs.length = 0; renderLogs(); });
 
 // ---------- 3. 事件总线 ----------
-listen("frontend", (e) => handleEvent(e.payload));
+// 事件是「快速通道」,轮询是兜底;若监听注册失败会写日志,便于排查
+listen("frontend", (e) => handleEvent(e.payload))
+  .catch((err) => { try { addLog("error", "前端事件监听失败: " + err); } catch (e) { /* 忽略 */ } });
 
 function handleEvent(ev) {
   switch (ev.type) {
@@ -1044,45 +1046,82 @@ $("#btn-detail-stop").addEventListener("click", async () => {
   } catch (e) { alert("停止失败: " + e); }
 });
 
-// 直播:完整轨迹事件(新 turn 开始 / 决策 / 最终输出 / 错误)。
-// msg_out / think 为「收尾事件」:更新直播中创建的卡片为最终全量文本,不再追加新卡片。
+// 直播:完整轨迹事件 → 触发一次即时详情刷新。
+// 渲染统一走轮询路径(单一路径),避免事件+轮询双路径重复渲染卡片。
+let detailPollTimer = null;
+function scheduleDetailPoll() {
+  if (!detailState.key) return;
+  if (detailPollTimer) return;
+  detailPollTimer = setTimeout(() => {
+    detailPollTimer = null;
+    pollDetail();
+  }, 80);
+}
+
 function handleTraceEvent(ev) {
   if (!detailState.key || ev.key !== detailState.key) return;
-  const entry = ev.entry;
-  if (entry.type === "msg_out") {
-    const block = detailState.turnBlocks.get(entry.turn);
-    if (block && block.outCard) {
-      const { card, body } = block.outCard;
-      block.outCard = null;
-      const u = entry.usage || {};
-      const ratio = u.cache_hit + u.cache_miss > 0 ? Math.round((u.cache_hit / (u.cache_hit + u.cache_miss)) * 100) : 0;
-      card.querySelector(".tl-title").textContent =
-        `🤖 AI 回复 · ${escapeHtml(entry.model)} · ${fmtTime(entry.ts)}`;
-      body.textContent = entry.text;
-      const foot = document.createElement("div");
-      foot.className = "tl-foot";
-      foot.textContent = `prompt ${(u.prompt_tokens || 0).toLocaleString()}t · 命中 ${(u.cache_hit || 0).toLocaleString()}t(${ratio}%) · 输出 ${(u.completion_tokens || 0).toLocaleString()}t${u.reasoning_tokens ? ` · 思考 ${u.reasoning_tokens.toLocaleString()}t` : ""}`;
-      card.appendChild(foot);
-      bindDetailActions();
-      return;
-    }
-    renderDetailEntry(entry);
-    bindDetailActions();
+  scheduleDetailPoll();
+}
+
+// 收尾直播输出卡片为最终全量文本
+function finalizeOutCard(block, entry) {
+  const { card, body } = block.outCard;
+  block.outCard = null;
+  const u = entry.usage || {};
+  const ratio = u.cache_hit + u.cache_miss > 0 ? Math.round((u.cache_hit / (u.cache_hit + u.cache_miss)) * 100) : 0;
+  card.querySelector(".tl-title").textContent =
+    `🤖 AI 回复 · ${escapeHtml(entry.model)} · ${fmtTime(entry.ts)}`;
+  body.textContent = entry.text;
+  const foot = document.createElement("div");
+  foot.className = "tl-foot";
+  foot.textContent = `prompt ${(u.prompt_tokens || 0).toLocaleString()}t · 命中 ${(u.cache_hit || 0).toLocaleString()}t(${ratio}%) · 输出 ${(u.completion_tokens || 0).toLocaleString()}t${u.reasoning_tokens ? ` · 思考 ${u.reasoning_tokens.toLocaleString()}t` : ""}`;
+  card.appendChild(foot);
+}
+
+// 收尾直播思考卡片为最终全量文本
+function finalizeThinkCard(block, entry) {
+  const { card, body } = block.thinkCard;
+  block.thinkCard = null;
+  card.querySelector(".tl-title").textContent =
+    `💭 思考过程 · ${(entry.tokens || 0).toLocaleString()} tokens · ${fmtTime(entry.ts)}`;
+  body.textContent = entry.text;
+}
+
+// 追加一条持久化事件:think/msg_out 若存在直播卡片则原地收尾,否则渲染新卡片
+function appendDetailEntry(entry) {
+  const block = detailState.turnBlocks.get(entry.turn);
+  if (entry.type === "msg_out" && block && block.outCard) {
+    finalizeOutCard(block, entry);
     return;
   }
-  if (entry.type === "think") {
-    const block = detailState.turnBlocks.get(entry.turn);
-    if (block && block.thinkCard) {
-      const { card, body } = block.thinkCard;
-      block.thinkCard = null;
-      card.querySelector(".tl-title").textContent =
-        `💭 思考过程 · ${(entry.tokens || 0).toLocaleString()} tokens · ${fmtTime(entry.ts)}`;
-      body.textContent = entry.text;
-      return;
-    }
+  if (entry.type === "think" && block && block.thinkCard) {
+    finalizeThinkCard(block, entry);
+    return;
   }
   renderDetailEntry(entry);
-  bindDetailActions();
+}
+
+// 详情页轮询:追加新持久化事件 + 同步直播缓冲(渲染唯一入口)
+async function pollDetail() {
+  if (!detailState.key) return;
+  try {
+    const d = await invoke("get_session_detail", { key: detailState.key });
+    const evs = d.events || [];
+    if (evs.length < detailState.renderedCount) {
+      // 轨迹被清空:整体重渲染
+      $("#detail-timeline").innerHTML = "";
+      detailState.turnBlocks.clear();
+      detailState.renderedCount = 0;
+    }
+    let appended = false;
+    while (detailState.renderedCount < evs.length) {
+      appendDetailEntry(evs[detailState.renderedCount]);
+      detailState.renderedCount += 1;
+      appended = true;
+    }
+    if (appended) bindDetailActions();
+    syncLiveTurn(d.live);
+  } catch (e) { /* 忽略 */ }
 }
 
 // 确保某 turn 的直播思考卡片存在,返回 {card, body}
@@ -1234,7 +1273,7 @@ async function pollLive() {
   if (stale) { refreshSessions(); } else {
     for (const s of list) patchSessionRow(s);
   }
-  // 详情页:状态 + 计数 + 直播缓冲
+  // 详情页:状态 + 计数 + 事件/直播缓冲(渲染唯一入口)
   if (detailState.key) {
     const cur = list.find((x) => x.key === detailState.key);
     if (cur) {
@@ -1242,24 +1281,7 @@ async function pollLive() {
       $("#detail-meta").textContent =
         `${cur.count} 条消息 · 约 ${(cur.tokens || 0).toLocaleString()} tokens${cur.has_summary ? " · 含摘要" : ""}`;
     }
-    try {
-      const d = await invoke("get_session_detail", { key: detailState.key });
-      const evs = d.events || [];
-      if (evs.length < detailState.renderedCount) {
-        // 轨迹被清空:整体重渲染
-        $("#detail-timeline").innerHTML = "";
-        detailState.turnBlocks.clear();
-        detailState.renderedCount = 0;
-      }
-      let appended = false;
-      while (detailState.renderedCount < evs.length) {
-        renderDetailEntry(evs[detailState.renderedCount]);
-        detailState.renderedCount += 1;
-        appended = true;
-      }
-      if (appended) bindDetailActions();
-      syncLiveTurn(d.live);
-    } catch (e) { /* 忽略 */ }
+    await pollDetail();
   }
 }
 setInterval(pollLive, 1500);
