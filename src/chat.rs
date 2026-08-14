@@ -580,8 +580,9 @@ impl ChatCore {
     }
 
     /// 记录群聊轨迹(仅群聊;窗口与条数按注入模式取配置)。
-    /// window 模式按 window_minutes 保留;all / triggered_only 保留 24 小时
-    /// (触发时才有更多上下文可注入),条数上限始终生效。
+    /// window 模式按 window_minutes 保留;all / triggered_only 保留 24 小时。
+    /// all 模式不设条数上限(用户显式选择「全部注入,无上限」);
+    /// triggered_only 仍以 max_entries 作为缓冲安全上限。
     async fn record_trail(&self, key: &str, text: &str) {
         if !key.starts_with('g') {
             return;
@@ -595,7 +596,9 @@ impl ChatCore {
             )
         };
         let window_secs = if mode == "window" { win } else { 86400 };
-        self.trail_push(key, text, window_secs, max);
+        // all 模式:max_entries 传 0 表示不设条数上限
+        let max_entries = if mode == "all" { 0 } else { max };
+        self.trail_push(key, text, window_secs, max_entries);
     }
 
     /// 决策器:开启时由当前模型判断这条消息是否需要回复。
@@ -1032,12 +1035,13 @@ impl ChatCore {
                 } else {
                     86400
                 };
-                if let Some(content) = render_trail(
-                    &lines,
-                    window_secs,
-                    trail_cfg.max_tokens,
-                    ratio,
-                ) {
+                // all 模式:max_tokens 传 0 = 不设 token 上限,全部注入
+                let max_tokens = if trail_cfg.inject_mode == "all" {
+                    0
+                } else {
+                    trail_cfg.max_tokens
+                };
+                if let Some(content) = render_trail(&lines, window_secs, max_tokens, ratio) {
                     msgs.push(ApiMessage {
                         role: "user".into(),
                         content,
@@ -1677,7 +1681,8 @@ impl ChatCore {
             .insert(key.to_string(), count);
     }
 
-    /// 记录群聊轨迹(未触发对话的消息),按窗口与条数限制
+    /// 记录群聊轨迹(未触发对话的消息),按窗口与条数限制。
+    /// max_entries == 0 表示不设条数上限(「全部注入」模式)。
     fn trail_push(&self, key: &str, text: &str, window_secs: u64, max_entries: usize) {
         let text = text.trim();
         if text.is_empty() {
@@ -1692,8 +1697,10 @@ impl ChatCore {
                 .unwrap_or(false)
         });
         q.push_back((now, text.to_string()));
-        while q.len() > max_entries.max(1) {
-            q.pop_front();
+        if max_entries > 0 {
+            while q.len() > max_entries {
+                q.pop_front();
+            }
         }
     }
 
@@ -1960,7 +1967,8 @@ fn pseudo_random() -> f64 {
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// 渲染群聊轨迹为一条 user 消息内容(窗口过滤 + 从最新截断到 max_tokens)
+/// 渲染群聊轨迹为一条 user 消息内容(窗口过滤 + 从最新截断到 max_tokens)。
+/// max_tokens == 0 表示不设 token 上限(「全部注入」模式),整段缓冲全部渲染。
 pub fn render_trail(
     lines: &VecDeque<(SystemTime, String)>,
     window_secs: u64,
@@ -1984,15 +1992,21 @@ pub fn render_trail(
     if rendered.is_empty() {
         return None;
     }
-    // 从最新往前保留,直到 token 上限
+    // 从最新往前保留,直到 token 上限(0 = 无上限)
     let mut total = 0u32;
     let mut kept: Vec<&String> = Vec::new();
-    for line in rendered.iter().rev() {
-        total = total.saturating_add(estimate_tokens(line, ratio));
-        if total > max_tokens.max(1) {
-            break;
+    if max_tokens == 0 {
+        for line in rendered.iter().rev() {
+            kept.push(line);
         }
-        kept.push(line);
+    } else {
+        for line in rendered.iter().rev() {
+            total = total.saturating_add(estimate_tokens(line, ratio));
+            if total > max_tokens.max(1) {
+                break;
+            }
+            kept.push(line);
+        }
     }
     if kept.is_empty() {
         return None;
@@ -2090,9 +2104,13 @@ mod tests {
         assert!(out.contains("令牌"));
         assert!(out.contains('[')); // 时间戳格式 [HH:MM]
         // token 上限较小:只保留最新一条(旧的一条放不下)
-        let out2 = render_trail(&VecDeque::from(lines), 300, 10, 1.0).unwrap();
+        let out2 = render_trail(&VecDeque::from(lines.clone()), 300, 10, 1.0).unwrap();
         assert!(out2.contains("令牌"));
         assert!(!out2.contains("你好"));
+        // max_tokens = 0:不设上限(「全部注入」模式),整段缓冲全部保留
+        let out3 = render_trail(&VecDeque::from(lines), 300, 0, 1.0).unwrap();
+        assert!(out3.contains("你好"));
+        assert!(out3.contains("令牌"));
         // 过期消息被过滤
         let old = now - Duration::from_secs(600);
         let lines2 = vec![(old, "过期".to_string())];
