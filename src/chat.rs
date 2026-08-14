@@ -289,6 +289,16 @@ pub fn read_history_summary(file: &Path) -> (usize, u64, bool, Option<String>) {
 
 // ---------- 会话状态 ----------
 
+/// 进行中回复的直播缓冲(事件链路之外的前端兜底:轮询会话详情也能看到流式进展)
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct LiveTurn {
+    pub turn: String,
+    /// 已累计的思考内容
+    pub reasoning: String,
+    /// 已累计的正文内容
+    pub content: String,
+}
+
 /// 会话状态(执行中/审批中为 agent 功能预留的占位状态,当前未启用)
 #[allow(dead_code)]
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,6 +358,8 @@ pub struct ChatCore {
     pub status: StdMutex<HashMap<String, SessionStatus>>,
     /// 进行中回复的中止通道(key -> sender)
     pub aborts: StdMutex<HashMap<String, watch::Sender<bool>>>,
+    /// 进行中回复的直播缓冲(key -> 已累计思考/正文;轮询兜底用)
+    pub live: StdMutex<HashMap<String, LiveTurn>>,
     /// 费用追踪(与命令层共享)
     pub cost: Arc<StdMutex<CostTracker>>,
     /// 记忆位置自动控制状态(与命令层共享)
@@ -384,6 +396,7 @@ impl ChatCore {
             trail: StdMutex::new(HashMap::new()),
             status: StdMutex::new(HashMap::new()),
             aborts: StdMutex::new(HashMap::new()),
+            live: StdMutex::new(HashMap::new()),
             cost,
             placement,
             mem_changes: AtomicU64::new(0),
@@ -964,13 +977,26 @@ impl ChatCore {
                 ev = stream.next_event() => {
                     match ev {
                         None => break,
-                        Some(Err(e)) => return (Err(e), pending_sent),
+                        Some(Err(e)) => {
+                            self.live.lock().unwrap().remove(key);
+                            return (Err(e), pending_sent);
+                        }
                         Some(Ok(StreamEvent::Reasoning { delta })) => {
                             if first_token_at.is_none() {
                                 first_token_at = Some(Instant::now());
                             }
                             self.set_status(key, SessionStatus::Thinking).await;
                             self.turn_delta(key, turn, "think", &delta);
+                            // 直播缓冲(前端轮询兜底)
+                            {
+                                let mut m = self.live.lock().unwrap();
+                                let lt = m.entry(key.to_string()).or_insert_with(|| LiveTurn {
+                                    turn: turn.to_string(),
+                                    reasoning: String::new(),
+                                    content: String::new(),
+                                });
+                                lt.reasoning.push_str(&delta);
+                            }
                         }
                         Some(Ok(StreamEvent::Content { delta })) => {
                             if first_token_at.is_none() {
@@ -979,6 +1005,15 @@ impl ChatCore {
                             got_content = true;
                             self.set_status(key, SessionStatus::Replying).await;
                             self.turn_delta(key, turn, "out", &delta);
+                            {
+                                let mut m = self.live.lock().unwrap();
+                                let lt = m.entry(key.to_string()).or_insert_with(|| LiveTurn {
+                                    turn: turn.to_string(),
+                                    reasoning: String::new(),
+                                    content: String::new(),
+                                });
+                                lt.content.push_str(&delta);
+                            }
                         }
                     }
                 }
@@ -998,6 +1033,7 @@ impl ChatCore {
                 }
             }
         }
+        self.live.lock().unwrap().remove(key);
         (Ok(stream.finish()), pending_sent)
     }
 
@@ -1890,12 +1926,13 @@ impl ChatCore {
         list
     }
 
-    /// 会话详情(轨迹时间线 + 摘要信息);机器人未运行时由命令层直接读盘
+    /// 会话详情(轨迹时间线 + 摘要信息 + 进行中回复的直播缓冲);机器人未运行时由命令层直接读盘
     pub async fn session_detail(&self, key: &str) -> serde_json::Value {
         let trace_path = self.trace_dir.join(format!("{key}.jsonl"));
         let events = TraceStore::read_all(&trace_path);
         let file = self.sessions_dir.join(format!("{key}.jsonl"));
         let (count, tokens, has_summary, summary) = read_history_summary(&file);
+        let live = self.live.lock().unwrap().get(key).cloned();
         json!({
             "key": key,
             "status": self.get_status(key).as_str(),
@@ -1905,6 +1942,7 @@ impl ChatCore {
             "has_summary": has_summary,
             "summary": summary,
             "events": events,
+            "live": live,
         })
     }
 

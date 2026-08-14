@@ -276,6 +276,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
   display: flex; align-items: stretch; justify-content: flex-end;
 }
 .overlay.hidden { display: none; }
+/* 通用隐藏工具类(修复:#detail-summary 等带 .hidden 的元素此前未被隐藏) */
+.hidden { display: none !important; }
 .detail-panel {
   width: min(860px, 92vw); height: 100vh;
   background: var(--bg); border-left: 1px solid var(--border);

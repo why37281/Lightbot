@@ -620,6 +620,7 @@ async function refreshSessions() {
         </span>
       </td>`;
     tr.querySelector(".status-cell").appendChild(statusCapsule(s.status || "idle"));
+    tr.querySelector(".status-cell").dataset.status = s.status || "idle";
     // 整行可点开详情页;按钮单独处理(不冒泡)
     tr.addEventListener("click", () => openSessionDetail(s.key));
     tr.querySelector(".clear-session").addEventListener("click", async (e) => {
@@ -804,6 +805,7 @@ $("#btn-query-balance").addEventListener("click", async () => {
 const detailState = {
   key: null,
   turnBlocks: new Map(), // turn -> {el, thinkCard, outCard}
+  renderedCount: 0,      // 已渲染的持久化事件数(轮询只追加新事件,避免重复)
 };
 
 function fmtTime(ts) {
@@ -962,14 +964,19 @@ async function openSessionDetail(key) {
   for (const ev of d.events || []) {
     renderDetailEntry(ev);
   }
+  detailState.renderedCount = (d.events || []).length;
+  // 打开时若该会话正在回复:直接渲染直播缓冲(事件与轮询双保险)
+  if (d.live) syncLiveTurn(d.live);
   // 为编辑/删除按钮绑定(渲染后统一绑定)
   bindDetailActions();
 }
 
 function setDetailStatus(status) {
+  // 直接替换自身类名与文本,不再向 #detail-status 内嵌套胶囊(修复双层胶囊)
+  const m = STATUS_META[status] || STATUS_META.idle;
   const el = $("#detail-status");
-  el.innerHTML = "";
-  el.appendChild(statusCapsule(status));
+  el.className = "capsule " + m.cls;
+  el.textContent = m.label;
 }
 
 function bindDetailActions() {
@@ -1078,29 +1085,61 @@ function handleTraceEvent(ev) {
   bindDetailActions();
 }
 
-// 直播:思考/正文增量(流式,QQ 侧并非流式,详情页直播)
+// 确保某 turn 的直播思考卡片存在,返回 {card, body}
+function ensureLiveThinkCard(turn) {
+  const block = turnBlock(turn);
+  if (!block.thinkCard) {
+    const card = tlCard("think", "💭 思考过程(进行中)");
+    const body = tlBody(card, "");
+    body.classList.add("collapsible-body");
+    card.querySelector(".tl-title").style.cursor = "pointer";
+    card.querySelector(".tl-title").addEventListener("click", () => body.classList.toggle("folded"));
+    block.el.appendChild(card);
+    block.thinkCard = { card, body };
+  }
+  return block.thinkCard;
+}
+
+// 确保某 turn 的直播输出卡片存在,返回 {card, body}
+function ensureLiveOutCard(turn) {
+  const block = turnBlock(turn);
+  if (!block.outCard) {
+    const card = tlCard("msg-out", "🤖 AI 回复(进行中)");
+    const body = tlBody(card, "");
+    block.el.appendChild(card);
+    block.outCard = { card, body };
+  }
+  return block.outCard;
+}
+
+// 直播:思考/正文增量(事件驱动;QQ 侧并非流式,详情页直播)
 function handleTurnDelta(ev) {
   if (!detailState.key || ev.key !== detailState.key) return;
-  const block = turnBlock(ev.turn);
   if (ev.kind === "think") {
-    if (!block.thinkCard) {
-      const card = tlCard("think", "💭 思考过程(进行中)");
-      const body = tlBody(card, "");
-      body.classList.add("collapsible-body");
-      card.querySelector(".tl-title").style.cursor = "pointer";
-      card.querySelector(".tl-title").addEventListener("click", () => body.classList.toggle("folded"));
-      block.el.appendChild(card);
-      block.thinkCard = { card, body };
-    }
-    block.thinkCard.body.textContent += ev.text;
+    const { body } = ensureLiveThinkCard(ev.turn);
+    body.textContent += ev.text;
   } else if (ev.kind === "out") {
-    if (!block.outCard) {
-      const card = tlCard("msg-out", "🤖 AI 回复(进行中)");
-      const body = tlBody(card, "");
-      block.el.appendChild(card);
-      block.outCard = { card, body };
+    const { body } = ensureLiveOutCard(ev.turn);
+    body.textContent += ev.text;
+  }
+  $("#detail-timeline").scrollTop = $("#detail-timeline").scrollHeight;
+}
+
+// 轮询兜底:把后端直播缓冲同步到详情页(事件链路异常时流式显示仍可用)
+function syncLiveTurn(live) {
+  if (!live || !detailState.key) return;
+  turnBlock(live.turn);
+  if (live.reasoning) {
+    const { body } = ensureLiveThinkCard(live.turn);
+    if (body.textContent.length <= live.reasoning.length) {
+      body.textContent = live.reasoning;
     }
-    block.outCard.body.textContent += ev.text;
+  }
+  if (live.content) {
+    const { body } = ensureLiveOutCard(live.turn);
+    if (body.textContent.length <= live.content.length) {
+      body.textContent = live.content;
+    }
   }
   $("#detail-timeline").scrollTop = $("#detail-timeline").scrollHeight;
 }
@@ -1160,6 +1199,70 @@ $("#btn-approve-no").addEventListener("click", async () => {
     addLog("info", `已拒绝切换提案,进入 ${cdText} 冷却`);
   } catch (e) { /* 忽略 */ }
 });
+
+// ---------- 实时更新兜底(轮询:即使事件链路异常,列表/详情页也会自动刷新) ----------
+function patchSessionRow(s) {
+  const tbody = $("#session-table tbody");
+  const row = tbody.querySelector(`tr[data-key="${CSS.escape(s.key)}"]`);
+  if (!row) { refreshSessions(); return; }
+  const tds = row.children; // 状态(0) 会话(1) 消息数(2) tokens(3) 摘要(4) 操作(5)
+  const want = s.status || "idle";
+  if (tds[0].dataset.status !== want) {
+    tds[0].dataset.status = want;
+    tds[0].innerHTML = "";
+    tds[0].appendChild(statusCapsule(want));
+  }
+  if (tds[2].textContent !== String(s.count)) tds[2].textContent = s.count;
+  if (tds[3].textContent !== String(s.tokens)) tds[3].textContent = s.tokens;
+  const sum = s.has_summary ? "✓" : "-";
+  if (tds[4].textContent !== sum) tds[4].textContent = sum;
+}
+
+async function pollLive() {
+  if (!running) return;
+  let list = [];
+  try { list = await invoke("get_sessions"); } catch (e) { return; }
+  const tbody = $("#session-table tbody");
+  // 行数与磁盘不一致(新增/删除会话)时整体重建;否则原位修补,避免打断 ⋯ 菜单
+  const keys = new Set(list.map((s) => s.key));
+  let stale = tbody.children.length !== list.length;
+  if (!stale) {
+    for (const tr of tbody.children) {
+      if (!keys.has(tr.dataset.key)) { stale = true; break; }
+    }
+  }
+  if (stale) { refreshSessions(); } else {
+    for (const s of list) patchSessionRow(s);
+  }
+  // 详情页:状态 + 计数 + 直播缓冲
+  if (detailState.key) {
+    const cur = list.find((x) => x.key === detailState.key);
+    if (cur) {
+      setDetailStatus(cur.status);
+      $("#detail-meta").textContent =
+        `${cur.count} 条消息 · 约 ${(cur.tokens || 0).toLocaleString()} tokens${cur.has_summary ? " · 含摘要" : ""}`;
+    }
+    try {
+      const d = await invoke("get_session_detail", { key: detailState.key });
+      const evs = d.events || [];
+      if (evs.length < detailState.renderedCount) {
+        // 轨迹被清空:整体重渲染
+        $("#detail-timeline").innerHTML = "";
+        detailState.turnBlocks.clear();
+        detailState.renderedCount = 0;
+      }
+      let appended = false;
+      while (detailState.renderedCount < evs.length) {
+        renderDetailEntry(evs[detailState.renderedCount]);
+        detailState.renderedCount += 1;
+        appended = true;
+      }
+      if (appended) bindDetailActions();
+      syncLiveTurn(d.live);
+    } catch (e) { /* 忽略 */ }
+  }
+}
+setInterval(pollLive, 1500);
 
 // ---------- 初始化 ----------
 loadConfig().catch((e) => {
