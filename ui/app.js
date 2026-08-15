@@ -115,7 +115,9 @@ async function fetchEvents() {
 let eventPollTimer = null;
 function startEventPoller() {
   if (eventPollTimer) clearInterval(eventPollTimer);
-  const ms = Math.min(5000, Math.max(200, parseInt(cfg?.ui_refresh_ms) || 500));
+  // 无最小值限制(仅要求为正数,否则回落默认 500);保留 5000 上限防误填
+  const raw = parseInt(cfg?.ui_refresh_ms);
+  const ms = Math.min(5000, raw > 0 ? raw : 500);
   eventPollTimer = setInterval(fetchEvents, ms);
   fetchEvents(); // 立即拉一次
 }
