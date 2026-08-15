@@ -26,6 +26,8 @@ pub struct Config {
     pub active_prompt: String,
     /// 费用与钱包配置(价格随 DeepSeek 官方调价更新,由用户在 GUI 填写)
     pub cost: CostConfig,
+    /// 界面事件轮询间隔(毫秒,默认 500):状态灯/日志/开销面板的拉取频率
+    pub ui_refresh_ms: u64,
 }
 
 impl Default for Config {
@@ -41,6 +43,7 @@ impl Default for Config {
             prompts: vec![PromptPreset::default()],
             active_prompt: "default".into(),
             cost: CostConfig::default(),
+            ui_refresh_ms: 500,
         }
     }
 }

@@ -20,13 +20,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::config::{Config, MemoryConfig, ModelConfig, TrailConfig};
 use crate::cost::{CostTracker, UsageRecord};
@@ -73,7 +73,7 @@ pub enum FrontendEvent {
     SessionStatus { key: String, status: String },
     /// 完整轨迹事件(会话详情页时间线 + 落盘)
     Trace { key: String, entry: TraceEvent },
-    /// 流式增量:kind = "think" | "out"(会话详情页直播)
+    /// 流式增量(暂未启用:详情页流式显示走 live 缓冲轮询)
     TurnDelta {
         key: String,
         turn: String,
@@ -82,6 +82,49 @@ pub enum FrontendEvent {
     },
     /// 记忆位置切换提案(醒目弹窗审批)
     PlacementProposal { proposal: placement::Proposal },
+}
+
+/// 事件环形缓冲(拉模式):前端通过 get_events 轮询拉取,不再依赖 Tauri 推送事件
+/// (推送链路在部分环境下不可用,invoke 拉取已被证明可靠)。
+pub struct EventBuf {
+    next_seq: u64,
+    events: VecDeque<(u64, FrontendEvent)>,
+}
+
+impl EventBuf {
+    pub fn new() -> Self {
+        Self {
+            next_seq: 1,
+            events: VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, ev: FrontendEvent) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.events.push_back((seq, ev));
+        // 环形上限:防止长时间运行无限增长(日志面板自身也只保留 2000 行)
+        while self.events.len() > 2000 {
+            self.events.pop_front();
+        }
+    }
+
+    /// 返回 seq > after 的全部事件与当前最新 seq(事件被环形淘汰时前端靠 latest 对齐)
+    pub fn after(&self, after: u64) -> (Vec<(u64, FrontendEvent)>, u64) {
+        let mut out = Vec::new();
+        for (seq, ev) in &self.events {
+            if *seq > after {
+                out.push((*seq, ev.clone()));
+            }
+        }
+        (out, self.next_seq.saturating_sub(1))
+    }
+}
+
+impl Default for EventBuf {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------- token 估算 ----------
@@ -345,7 +388,8 @@ pub struct ChatCore {
     pub sessions_dir: PathBuf,
     /// 配置文件路径(/model、/prompt 命令切换后自动保存)
     pub cfg_path: PathBuf,
-    pub events: mpsc::Sender<FrontendEvent>,
+    /// 前端事件缓冲(拉模式:前端经 get_events 轮询取走)
+    pub events: Arc<StdMutex<EventBuf>>,
     /// 群活跃度跟踪:key -> 最近窗口内消息时间戳(插话采样用)
     pub activity: StdMutex<HashMap<String, VecDeque<Instant>>>,
     /// 每群消息计数(插话条数冷却)
@@ -360,6 +404,12 @@ pub struct ChatCore {
     pub aborts: StdMutex<HashMap<String, watch::Sender<bool>>>,
     /// 会话忙碌时暂存的消息队列(key -> (消息, turn)),回合结束后按序补处理
     pub pending_msgs: StdMutex<HashMap<String, VecDeque<(ParsedMsg, String)>>>,
+    /// 每会话消息串行门(跨会话并行:同群保序,不同群互不阻塞)
+    pub msg_gates: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// 全局暂停回复(与命令层共享):true 时只接收消息,不决策/不回复/不思考
+    pub paused: Arc<AtomicBool>,
+    /// 决策器全局中止通道(暂停时取消进行中的决策请求)
+    pub decide_cancel: watch::Sender<bool>,
     /// 进行中回复的直播缓冲(key -> 已累计思考/正文;轮询兜底用)
     pub live: StdMutex<HashMap<String, LiveTurn>>,
     /// 费用追踪(与命令层共享)
@@ -378,9 +428,11 @@ impl ChatCore {
         sender: ActionSender,
         sessions_dir: PathBuf,
         cfg_path: PathBuf,
-        events: mpsc::Sender<FrontendEvent>,
+        events: Arc<StdMutex<EventBuf>>,
         cost: Arc<StdMutex<CostTracker>>,
         placement: Arc<StdMutex<PlacementController>>,
+        paused: Arc<AtomicBool>,
+        decide_cancel: watch::Sender<bool>,
     ) -> Self {
         let trace_dir = sessions_dir.join("traces");
         Self {
@@ -399,21 +451,24 @@ impl ChatCore {
             status: StdMutex::new(HashMap::new()),
             aborts: StdMutex::new(HashMap::new()),
             pending_msgs: StdMutex::new(HashMap::new()),
+            msg_gates: RwLock::new(HashMap::new()),
             live: StdMutex::new(HashMap::new()),
             cost,
             placement,
+            paused,
+            decide_cancel,
             mem_changes: AtomicU64::new(0),
         }
     }
 
     fn log(&self, level: &str, msg: &str) {
-        let _ = self.events.try_send(FrontendEvent::Log {
+        self.events.lock().unwrap().push(FrontendEvent::Log {
             level: level.to_string(),
             msg: msg.to_string(),
         });
     }
 
-    /// 会话状态变化:状态表更新 + 事件(await 发送,确保前端状态灯/胶囊不因通道满而丢失)
+    /// 会话状态变化:状态表更新 + 事件入环形缓冲(前端经 get_events 拉取)
     async fn set_status(&self, key: &str, s: SessionStatus) {
         {
             let mut m = self.status.lock().unwrap();
@@ -423,13 +478,10 @@ impl ChatCore {
             }
             *cur = s;
         }
-        let _ = self
-            .events
-            .send(FrontendEvent::SessionStatus {
-                key: key.to_string(),
-                status: s.as_str().to_string(),
-            })
-            .await;
+        self.events.lock().unwrap().push(FrontendEvent::SessionStatus {
+            key: key.to_string(),
+            status: s.as_str().to_string(),
+        });
     }
 
     pub fn get_status(&self, key: &str) -> SessionStatus {
@@ -441,28 +493,50 @@ impl ChatCore {
             .unwrap_or(SessionStatus::Idle)
     }
 
+    /// 每会话消息串行门(跨会话并行:同群保序,不同群互不阻塞)
+    async fn get_gate(&self, key: &str) -> Arc<Mutex<()>> {
+        {
+            let map = self.msg_gates.read().await;
+            if let Some(g) = map.get(key) {
+                return g.clone();
+            }
+        }
+        let mut map = self.msg_gates.write().await;
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// 全局暂停:中止所有进行中的流式回复与决策请求、清空排队。
+    /// 暂停后消息仍接收/记录,但不再决策与回复;resume_processing 恢复。
+    pub fn stop_all_processing(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        for tx in self.aborts.lock().unwrap().values() {
+            let _ = tx.send(true);
+        }
+        self.pending_msgs.lock().unwrap().clear();
+        let _ = self.decide_cancel.send(true);
+    }
+
+    pub fn resume_processing(&self) {
+        let _ = self.decide_cancel.send(false);
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
     // ---------- 轨迹与费用 ----------
 
     async fn trace_push(&self, key: &str, ev: &TraceEvent) {
-        let _ = self
-            .events
-            .send(FrontendEvent::Trace {
-                key: key.to_string(),
-                entry: ev.clone(),
-            })
-            .await;
+        self.events.lock().unwrap().push(FrontendEvent::Trace {
+            key: key.to_string(),
+            entry: ev.clone(),
+        });
         let store = TraceStore::new(self.trace_dir.join(format!("{key}.jsonl")));
         store.push(ev);
     }
 
     fn turn_delta(&self, key: &str, turn: &str, kind: &str, text: &str) {
-        // 增量事件允许丢弃(通道满时):最终全量由 Trace(MsgOut/Think) 修正
-        let _ = self.events.try_send(FrontendEvent::TurnDelta {
-            key: key.to_string(),
-            turn: turn.to_string(),
-            kind: kind.to_string(),
-            text: text.to_string(),
-        });
+        // 详情页流式显示已改走 live 缓冲轮询,增量事件不再入缓冲(避免挤占日志事件)
+        let _ = (key, turn, kind, text);
     }
 
     fn record_usage(&self, model: &ModelConfig, category: &str, usage: &Usage) {
@@ -482,18 +556,15 @@ impl ChatCore {
     }
 
     async fn emit_llm_stats(&self, model: &ModelConfig, usage: &Usage, elapsed_ms: u64) {
-        let _ = self
-            .events
-            .send(FrontendEvent::LlmStats {
-                model: model.model.clone(),
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                cache_hit: usage.cache_hit,
-                cache_miss: usage.cache_miss,
-                reasoning_tokens: usage.reasoning_tokens,
-                elapsed_ms,
-            })
-            .await;
+        self.events.lock().unwrap().push(FrontendEvent::LlmStats {
+            model: model.model.clone(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cache_hit: usage.cache_hit,
+            cache_miss: usage.cache_miss,
+            reasoning_tokens: usage.reasoning_tokens,
+            elapsed_ms,
+        });
     }
 
     /// 记忆发生变更时递增计数(模型写入/删除、/remember、/forget、GUI 增删)
@@ -503,14 +574,36 @@ impl ChatCore {
 
     // ---------- 事件入口 ----------
 
-    /// 事件入口:消息分流 —— 被动触发/软 at/命令走完整通道,插话采样走轻量通道
+    /// 事件入口:消息分流 —— 被动触发/软 at/命令走完整通道,插话采样走轻量通道。
+    /// 每会话串行门:同群消息严格保序,不同群/私聊并行处理(互不阻塞)。
     pub async fn handle_message(&self, msg: ParsedMsg) {
         if msg.is_self {
             return;
         }
         let key = session_key(&msg);
+        // 每会话串行门(跨会话并行):同群消息严格保序,不同群/私聊互不阻塞
+        let gate = self.get_gate(&key).await;
+        let _gate = gate.lock().await;
         let turn = trace::new_id();
         self.emit_msg_in(&key, &msg.text);
+
+        // 全局暂停:只接收消息(记录日志与时间线),不决策、不回复、不思考
+        if self.paused.load(Ordering::Relaxed) {
+            self.log("info", &format!("[{key}] 已暂停回复,仅接收: {}", msg.text));
+            self.trace_push(
+                &key,
+                &TraceEvent::MsgIn {
+                    id: None,
+                    turn,
+                    ts: trace::now_ts(),
+                    trigger: "paused".into(),
+                    text: msg.text.clone(),
+                    ignored: true,
+                },
+            )
+            .await;
+            return;
+        }
 
         let cfg = self.cfg.read().await.clone();
         // 活跃度窗口(可配置,默认 2 分钟)
@@ -582,6 +675,18 @@ impl ChatCore {
                 self.full_dialogue(&key, &msg, &turn).await;
             } else {
                 self.log("info", &format!("[{key}] 决策器:无需回复(软 at)"));
+                self.trace_push(
+                    &key,
+                    &TraceEvent::MsgIn {
+                        id: None,
+                        turn: turn.clone(),
+                        ts: trace::now_ts(),
+                        trigger: "decided_no".into(),
+                        text: msg.text.clone(),
+                        ignored: true,
+                    },
+                )
+                .await;
             }
             return;
         }
@@ -610,11 +715,36 @@ impl ChatCore {
                 // 决策拒绝也消耗本次插话机会,防止高频重试
                 self.mark_interjected(&key);
                 self.log("info", &format!("[{key}] 决策器:无需回复(插话)"));
+                self.trace_push(
+                    &key,
+                    &TraceEvent::MsgIn {
+                        id: None,
+                        turn: turn.clone(),
+                        ts: trace::now_ts(),
+                        trigger: "decided_no".into(),
+                        text: msg.text.clone(),
+                        ignored: true,
+                    },
+                )
+                .await;
             }
         } else {
-            // 全部触发条件未命中:记录群聊轨迹(解决"鱼的记忆")
+            // 全部触发条件未命中:记录群聊轨迹(解决"鱼的记忆"),并写入时间线
+            // (修复:此前未触发消息不进轨迹文件,详情页看不到,显得"被吞掉")
             self.log("debug", &format!("[{key}] 未触发回复逻辑: {}", msg.text));
             self.record_trail(&key, &msg.text).await;
+            self.trace_push(
+                &key,
+                &TraceEvent::MsgIn {
+                    id: None,
+                    turn,
+                    ts: trace::now_ts(),
+                    trigger: "untriggered".into(),
+                    text: msg.text.clone(),
+                    ignored: true,
+                },
+            )
+            .await;
         }
     }
 
@@ -672,11 +802,30 @@ impl ChatCore {
         };
         self.set_status(key, SessionStatus::Deciding).await;
         let started = Instant::now();
-        let result = self.llm.decide(&model, &prompt, text, trigger_hint).await;
+        // 全局暂停时中止决策请求(select 丢弃 future 即取消 HTTP 请求)
+        let mut cancel_rx = self.decide_cancel.subscribe();
+        let result = tokio::select! {
+            r = self.llm.decide(&model, &prompt, text, trigger_hint) => Some(r),
+            _ = cancel_rx.changed() => None,
+        };
         self.set_status(key, SessionStatus::Idle).await;
         let ms = started.elapsed().as_millis() as u64;
         match result {
-            Ok((yes, usage)) => {
+            None => {
+                // 暂停中止:不回复(与"仅接收"语义一致)
+                self.log("info", &format!("[{key}] 已暂停,决策中止"));
+                self.trace_push(
+                    key,
+                    &TraceEvent::Error {
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: "已暂停,决策中止".into(),
+                    },
+                )
+                .await;
+                false
+            }
+            Some(Ok((yes, usage))) => {
                 self.record_usage(&model, "decide", &usage);
                 self.emit_llm_stats(&model, &usage, ms).await;
                 self.trace_push(
@@ -701,7 +850,7 @@ impl ChatCore {
                 );
                 yes
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 self.log("warn", &format!("决策器调用失败,按需要回复处理: {e}"));
                 self.trace_push(
                     key,
@@ -1312,9 +1461,10 @@ impl ChatCore {
         if let Some(p) = ctl.evaluate(&eval, Scheme::from_placement(&placement_str), trace::now_ts())
         {
             self.log("info", &format!("记忆位置评估:建议切换到 {}", p.to));
-            let _ = self
-                .events
-                .try_send(FrontendEvent::PlacementProposal { proposal: p });
+            self.events
+                .lock()
+                .unwrap()
+                .push(FrontendEvent::PlacementProposal { proposal: p });
         }
     }
 
@@ -1759,28 +1909,25 @@ impl ChatCore {
     }
 
     fn emit_msg_in(&self, key: &str, text: &str) {
-        let _ = self.events.try_send(FrontendEvent::MsgIn {
+        self.events.lock().unwrap().push(FrontendEvent::MsgIn {
             key: key.to_string(),
             text: text.to_string(),
         });
     }
 
     fn emit_msg_out(&self, key: &str, text: &str) {
-        let _ = self.events.try_send(FrontendEvent::MsgOut {
+        self.events.lock().unwrap().push(FrontendEvent::MsgOut {
             key: key.to_string(),
             text: text.to_string(),
         });
     }
 
     async fn emit_session(&self, key: &str, session: &Session) {
-        let _ = self
-            .events
-            .send(FrontendEvent::SessionChanged {
-                key: key.to_string(),
-                count: session.history.len(),
-                tokens: session.total_tokens(),
-            })
-            .await;
+        self.events.lock().unwrap().push(FrontendEvent::SessionChanged {
+            key: key.to_string(),
+            count: session.history.len(),
+            tokens: session.total_tokens(),
+        });
     }
 
     // ---------- 活跃度与插话 ----------
@@ -1939,6 +2086,11 @@ impl ChatCore {
                         self.status.lock().unwrap().remove(&k);
                         self.log("info", &format!("[{k}] 会话空闲超过 {hours} 小时,已从内存清理"));
                     }
+                    // 串行门随会话一并清理
+                    self.msg_gates
+                        .write()
+                        .await
+                        .retain(|k, _| map.contains_key(k));
                 }
             }
         }

@@ -12,7 +12,6 @@
 
 const T = window.__TAURI__;
 const invoke = T ? T.core.invoke : async () => { throw new Error("请在 Tauri 桌面环境中运行"); };
-const listen = T ? T.event.listen : async () => {};
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -96,10 +95,30 @@ function renderLogs() {
 $("#log-level").addEventListener("change", renderLogs);
 $("#btn-clear-log").addEventListener("click", () => { logs.length = 0; renderLogs(); });
 
-// ---------- 3. 事件总线 ----------
-// 事件是「快速通道」,轮询是兜底;若监听注册失败会写日志,便于排查
-listen("frontend", (e) => handleEvent(e.payload))
-  .catch((err) => { try { addLog("error", "前端事件监听失败: " + err); } catch (e) { /* 忽略 */ } });
+// ---------- 3. 事件总线(拉模式) ----------
+// 事件走 get_events 轮询拉取(推送链路在部分环境下不可用,invoke 已被证明可靠)。
+// 轮询间隔可配置(cfg.ui_refresh_ms,默认 500ms)。
+let lastEventSeq = 0;
+
+async function fetchEvents() {
+  try {
+    const r = await invoke("get_events", { afterSeq: lastEventSeq });
+    for (const item of (r.events || [])) {
+      if (item.seq > lastEventSeq) lastEventSeq = item.seq;
+      if (item.event) handleEvent(item.event);
+    }
+    // 事件被环形缓冲淘汰时,以服务端最新序号对齐,避免反复拉取旧区间
+    if (r.latest_seq != null && r.latest_seq > lastEventSeq) lastEventSeq = r.latest_seq;
+  } catch (e) { /* 忽略 */ }
+}
+
+let eventPollTimer = null;
+function startEventPoller() {
+  if (eventPollTimer) clearInterval(eventPollTimer);
+  const ms = Math.min(5000, Math.max(200, parseInt(cfg?.ui_refresh_ms) || 500));
+  eventPollTimer = setInterval(fetchEvents, ms);
+  fetchEvents(); // 立即拉一次
+}
 
 function handleEvent(ev) {
   switch (ev.type) {
@@ -145,6 +164,7 @@ function updateStatusView(st) {
   const dot = $("#st-dot");
   const txt = $("#st-text");
   if (!running) { dot.className = "dot gray"; txt.textContent = "未启动"; }
+  else if (st.paused) { dot.className = "dot yellow"; txt.textContent = "已停止回复 · 仅接收消息"; }
   else if (st.connected) { dot.className = "dot green"; txt.textContent = "已连接 NapCat"; }
   else { dot.className = "dot red"; txt.textContent = "未连接"; }
 
@@ -153,6 +173,12 @@ function updateStatusView(st) {
   $("#ov-mode").textContent = st.mode === "reverse" ? "反向 WS" : "正向 WS";
   $("#ov-endpoint").textContent = st.endpoint || "-";
   $("#ov-self").textContent = st.self_id ? String(st.self_id) : (cfg?.napcat?.self_id || "自动获取中");
+}
+
+function updatePausedUi() {
+  const btn = $("#btn-detail-stop");
+  if (btn) btn.textContent = paused ? "▶ 恢复" : "■ 停止";
+  updateStatusView({ connected: true, mode: "", endpoint: "", self_id: null, last_error: "", paused });
 }
 
 function renderOverview() {
@@ -172,11 +198,14 @@ async function loadConfig() {
   renderOverview();
   const sv = await invoke("get_status_view");
   running = sv.running;
-  updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error });
+  paused = !!sv.paused;
+  updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error, paused });
+  updatePausedUi();
   $("#btn-toggle").textContent = running ? "停止" : "启动";
   await refreshSessions();
   await renderMemories();
   await refreshCost();
+  startEventPoller();
   // 兜底:启动时若有未处理的切换提案(事件可能已错过),弹窗提醒
   try {
     const p = await invoke("get_placement_proposal");
@@ -359,6 +388,8 @@ $("#btn-toggle").addEventListener("click", async () => {
       addLog("info", "机器人已启动");
     }
     running = !running;
+    paused = false;
+    updatePausedUi();
     btn.textContent = running ? "停止" : "启动";
     if (running) {
       // 启动后的过渡状态;稍后主动拉一次真实状态(不依赖事件链路)
@@ -866,7 +897,7 @@ function renderDetailEntry(ev) {
   const timeline = $("#detail-timeline");
   switch (ev.type) {
     case "msg_in": {
-      const triggerLabel = { at: "at 触发", reply: "引用回复", keyword: "关键词", private: "私聊", ignored: "★ 忽略", decided_no: "决策器拒绝" }[ev.trigger] || ev.trigger;
+      const triggerLabel = { at: "at 触发", reply: "引用回复", keyword: "关键词", private: "私聊", ignored: "★ 忽略", decided_no: "决策器拒绝", untriggered: "未触发", paused: "⏸ 仅接收(已暂停)" }[ev.trigger] || ev.trigger;
       const card = tlCard(ev.ignored ? "msg-ignored" : "msg-in",
         `👤 用户消息 · ${triggerLabel} · ${fmtTime(ev.ts)}`,
         editButtons(ev.id));
@@ -1038,12 +1069,13 @@ $("#btn-detail-back").addEventListener("click", () => {
 });
 
 $("#btn-detail-stop").addEventListener("click", async () => {
-  if (!detailState.key) return;
   try {
-    const ok = await invoke("stop_session", { key: detailState.key });
-    if (!ok) addLog("warn", "该会话当前没有进行中的回复");
-    else addLog("info", "已发送停止指令");
-  } catch (e) { alert("停止失败: " + e); }
+    const next = !paused;
+    await invoke("set_paused", { paused: next });
+    paused = next;
+    updatePausedUi();
+    addLog("info", next ? "已停止所有回复/决策/思考,仅接收消息" : "已恢复回复");
+  } catch (e) { alert("操作失败: " + e); }
 });
 
 // 直播:完整轨迹事件 → 触发一次即时详情刷新。
@@ -1259,6 +1291,14 @@ function patchSessionRow(s) {
 
 async function pollLive() {
   if (!running) return;
+  // 暂停状态同步(可能来自其他入口)
+  try {
+    const sv = await invoke("get_status_view");
+    if (!!sv.paused !== paused) {
+      paused = !!sv.paused;
+      updatePausedUi();
+    }
+  } catch (e) { /* 忽略 */ }
   let list = [];
   try { list = await invoke("get_sessions"); } catch (e) { return; }
   const tbody = $("#session-table tbody");

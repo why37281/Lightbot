@@ -20,8 +20,10 @@ pub fn run() {
             commands::get_config,
             commands::save_config,
             commands::get_config_path,
+            commands::get_events,
             commands::start_bot,
             commands::stop_bot,
+            commands::set_paused,
             commands::test_napcat,
             commands::test_llm,
             commands::get_sessions,
@@ -90,21 +92,25 @@ mod tests {
         let napcat = Arc::new(NapcatClient::new(cfg.clone(), ev_tx, status_tx).await);
         let (sender, _conn_task) = napcat.clone().run(cancel.clone()).await;
 
-        let (fe_tx, _fe_rx) = mpsc::channel::<crate::chat::FrontendEvent>(64);
+        let events = Arc::new(std::sync::Mutex::new(crate::chat::EventBuf::new()));
         let cost = Arc::new(std::sync::Mutex::new(
             crate::cost::CostTracker::new(std::env::temp_dir().join("lightbot_e2e_usage")),
         ));
         let placement = Arc::new(std::sync::Mutex::new(
             crate::placement::PlacementController::default(),
         ));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (decide_cancel, _) = watch::channel::<bool>(false);
         let chat = Arc::new(ChatCore::new(
             cfg.clone(),
             sender,
             std::env::temp_dir().join("lightbot_e2e_sessions"),
             std::env::temp_dir().join("lightbot_e2e_config.json"),
-            fe_tx,
+            events,
             cost,
             placement,
+            paused,
+            decide_cancel,
         ));
 
         // 事件管线

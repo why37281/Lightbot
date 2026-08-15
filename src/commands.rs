@@ -1,17 +1,18 @@
 //! Tauri 命令层:前端(GUI)调用入口 + 机器人生命周期管理。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{self, ChatCore, FrontendEvent};
+use crate::chat::{self, ChatCore, EventBuf, FrontendEvent};
 use crate::config::{self, Config, ModelConfig};
 use crate::cost::CostTracker;
 use crate::llm::LlmClient;
@@ -26,8 +27,8 @@ pub struct AppState {
     pub cfg_path: PathBuf,
     pub sessions_dir: PathBuf,
     pub config: Arc<RwLock<Config>>,
-    /// 前端事件总线
-    pub ev_tx: mpsc::Sender<FrontendEvent>,
+    /// 前端事件缓冲(拉模式:前端经 get_events 轮询;推送链路不可靠,已弃用)
+    pub events: Arc<Mutex<EventBuf>>,
     pub bot: Mutex<Option<BotHandle>>,
     /// 运行中的对话核心(命令层会话操作复用)
     pub chat: Mutex<Option<Arc<ChatCore>>>,
@@ -39,6 +40,8 @@ pub struct AppState {
     pub cost: Arc<Mutex<CostTracker>>,
     /// 记忆位置自动控制状态(机器人停止时审批流程仍可结算)
     pub placement: Arc<Mutex<PlacementController>>,
+    /// 全局暂停回复:true 时只接收消息,不决策/不回复(机器人重启后复位)
+    pub paused: Arc<AtomicBool>,
 }
 
 pub struct BotHandle {
@@ -66,13 +69,8 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let sessions_dir = config::sessions_dir(app.handle());
     let loaded = config::load_config(&cfg_path);
 
-    let (ev_tx, mut ev_rx) = mpsc::channel::<FrontendEvent>(1024);
-    let handle = app.handle().clone();
-    tauri::async_runtime::spawn(async move {
-        while let Some(ev) = ev_rx.recv().await {
-            let _ = handle.emit("frontend", ev);
-        }
-    });
+    // 拉模式事件缓冲:前端定时 get_events,不依赖 Tauri 事件推送
+    let events = Arc::new(Mutex::new(EventBuf::new()));
 
     // 用量目录与配置目录同级(应用数据目录)
     let usage_dir = app
@@ -86,15 +84,31 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         cfg_path,
         sessions_dir,
         config: Arc::new(RwLock::new(loaded)),
-        ev_tx,
+        events,
         bot: Mutex::new(None),
         chat: Mutex::new(None),
         restart_lock: tokio::sync::Mutex::new(()),
         last_status: Arc::new(Mutex::new(None)),
         cost: Arc::new(Mutex::new(CostTracker::new(usage_dir))),
         placement: Arc::new(Mutex::new(PlacementController::default())),
+        paused: Arc::new(AtomicBool::new(false)),
     });
     Ok(())
+}
+
+/// 拉取序号大于 after_seq 的前端事件(拉模式事件总线)
+#[tauri::command]
+pub async fn get_events(
+    state: tauri::State<'_, AppState>,
+    after_seq: u64,
+) -> Result<Value, String> {
+    let buf = state.events.lock().map_err(|e| e.to_string())?;
+    let (events, latest_seq) = buf.after(after_seq);
+    let arr: Vec<Value> = events
+        .into_iter()
+        .map(|(seq, ev)| serde_json::json!({ "seq": seq, "event": ev }))
+        .collect();
+    Ok(serde_json::json!({ "events": arr, "latest_seq": latest_seq }))
 }
 
 // ---------- 配置命令 ----------
@@ -122,12 +136,10 @@ pub async fn save_config(
     if let Some(b) = old_bot {
         b.stop().await;
         start_bot_inner(&state).await?;
-        let _ = state
-            .ev_tx
-            .try_send(FrontendEvent::Log {
-                level: "info".into(),
-                msg: "配置已保存,机器人已按新配置重启".into(),
-            });
+        state.events.lock().unwrap().push(FrontendEvent::Log {
+            level: "info".into(),
+            msg: "配置已保存,机器人已按新配置重启".into(),
+        });
     }
     Ok(())
 }
@@ -199,33 +211,45 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
     .await);
     let (sender, conn_task) = napcat.clone().run(cancel.clone()).await;
 
+    // 决策器全局中止通道(每次启动新建;暂停时发送 true 取消进行中的决策请求)
+    let (decide_cancel, _) = watch::channel::<bool>(false);
+    state.paused.store(false, Ordering::Relaxed);
+
     let chat = Arc::new(ChatCore::new(
         state.config.clone(),
         sender,
         state.sessions_dir.clone(),
         state.cfg_path.clone(),
-        state.ev_tx.clone(),
+        state.events.clone(),
         state.cost.clone(),
         state.placement.clone(),
+        state.paused.clone(),
+        decide_cancel,
     ));
 
     let mut tasks = Vec::new();
 
-    // 事件管线:消息 -> 对话;通知/请求 -> 前端展示
+    // 事件管线:消息 -> 对话(每消息独立任务:不同会话并行,同会话由串行门保序);
+    // 通知/请求 -> 事件缓冲
     let chat2 = chat.clone();
-    let ev_tx2 = state.ev_tx.clone();
+    let events2 = state.events.clone();
     tasks.push(tauri::async_runtime::spawn(async move {
         while let Some(ev) = bot_ev_rx.recv().await {
             match ev {
-                BotEvent::Message(m) => chat2.handle_message(m).await,
+                BotEvent::Message(m) => {
+                    let chat = chat2.clone();
+                    tauri::async_runtime::spawn(async move {
+                        chat.handle_message(m).await;
+                    });
+                }
                 BotEvent::Notice(n) => {
-                    let _ = ev_tx2.try_send(FrontendEvent::Notice {
+                    events2.lock().unwrap().push(FrontendEvent::Notice {
                         desc: n.desc,
                         notice_type: n.notice_type,
                     });
                 }
                 BotEvent::Request(r) => {
-                    let _ = ev_tx2.try_send(FrontendEvent::Notice {
+                    events2.lock().unwrap().push(FrontendEvent::Notice {
                         desc: format!(
                             "收到{}请求: {} (留言: {})",
                             if r.request_type == "friend" { "好友" } else { "加群" },
@@ -237,7 +261,7 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
                 }
                 BotEvent::Heartbeat => {}
                 BotEvent::Lifecycle(l) => {
-                    let _ = ev_tx2.try_send(FrontendEvent::Log {
+                    events2.lock().unwrap().push(FrontendEvent::Log {
                         level: "info".into(),
                         msg: format!("连接事件: {l}"),
                     });
@@ -246,15 +270,15 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
         }
     }));
 
-    // 连接状态 -> 前端(同时写快照供 get_status_view 兜底)
-    let ev_tx3 = state.ev_tx.clone();
+    // 连接状态 -> 事件缓冲(同时写快照供 get_status_view 兜底)
+    let events3 = state.events.clone();
     let last_status = state.last_status.clone();
     tasks.push(tauri::async_runtime::spawn(async move {
         while status_rx.changed().await.is_ok() {
             let s = status_rx.borrow().clone();
             *last_status.lock().unwrap() = Some(s.clone());
-            let _ = ev_tx3.try_send(FrontendEvent::Status { status: s.clone() });
-            let _ = ev_tx3.try_send(FrontendEvent::Log {
+            events3.lock().unwrap().push(FrontendEvent::Status { status: s.clone() });
+            events3.lock().unwrap().push(FrontendEvent::Log {
                 level: "info".into(),
                 msg: format!(
                     "连接状态: {}{}",
@@ -296,12 +320,41 @@ pub async fn stop_bot(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if let Some(b) = bot {
         b.stop().await;
         *state.chat.lock().map_err(|e| e.to_string())? = None;
-        let _ = state.ev_tx.try_send(FrontendEvent::Log {
+        state.paused.store(false, Ordering::Relaxed);
+        state.events.lock().unwrap().push(FrontendEvent::Log {
             level: "info".into(),
             msg: "机器人已停止".into(),
         });
     }
     Ok(())
+}
+
+/// 全局暂停/恢复:paused=true 时立即中止所有回复/决策/思考,只保留接收消息
+#[tauri::command]
+pub async fn set_paused(
+    state: tauri::State<'_, AppState>,
+    paused: bool,
+) -> Result<bool, String> {
+    {
+        let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
+        if let Some(c) = chat {
+            if paused {
+                c.stop_all_processing();
+            } else {
+                c.resume_processing();
+            }
+        }
+        state.paused.store(paused, Ordering::Relaxed);
+    }
+    state.events.lock().unwrap().push(FrontendEvent::Log {
+        level: "info".into(),
+        msg: if paused {
+            "已停止所有回复/决策/思考,仅接收消息".into()
+        } else {
+            "已恢复回复".into()
+        },
+    });
+    Ok(paused)
 }
 
 // ---------- 测试命令 ----------
@@ -643,7 +696,7 @@ pub async fn approve_placement(
             let cfg = state.config.read().await;
             config::save_config(&state.cfg_path, &cfg)?;
         }
-        let _ = state.ev_tx.try_send(FrontendEvent::Log {
+        let _ = state.events.lock().unwrap().push(FrontendEvent::Log {
             level: "info".into(),
             msg: format!("记忆位置已切换 -> {to}(自动控制,用户批准)"),
         });
@@ -673,11 +726,14 @@ pub struct StatusView {
     pub endpoint: String,
     pub self_id: Option<String>,
     pub last_error: String,
+    /// 全局暂停回复(仅接收消息)
+    pub paused: bool,
 }
 
 #[tauri::command]
 pub async fn get_status_view(state: tauri::State<'_, AppState>) -> Result<StatusView, String> {
     let running = state.bot.lock().map_err(|e| e.to_string())?.is_some();
+    let paused = state.paused.load(Ordering::Relaxed);
     let (mode, endpoint, self_id) = {
         let cfg = state.config.read().await;
         let n = &cfg.napcat;
@@ -704,5 +760,6 @@ pub async fn get_status_view(state: tauri::State<'_, AppState>) -> Result<Status
         endpoint,
         self_id: self_id.or(live_self.map(|i| i.to_string())),
         last_error,
+        paused,
     })
 }
