@@ -211,8 +211,11 @@ pub struct ChatConfig {
     /// 近期历史主动折叠阈值(token):历史超过该值就折叠进摘要(0 = 仅在超总预算时折叠)
     /// 仅方案一(记忆在历史后)使用。
     pub history_target_tokens: u32,
-    /// 忽略 * 前缀消息:QQ 消息以 * 开头时,模型不回复、不记入历史(给群友留自由交流空间)
-    pub ignore_star: bool,
+    /// 忽略前缀消息开关:以 ignore_prefix 开头时,不回复、不入历史、不触发
+    /// (入口拦截:引用消息/关键词消息同样被挡,给群友留自由交流空间)
+    pub ignore_prefix_enabled: bool,
+    /// 忽略前缀(逗号分隔多个,如 "*")
+    pub ignore_prefix: String,
     /// 方案二(摘要→记忆→新历史)的新历史折叠阈值(token):
     /// 新历史超过该值即把超出「保留条数」的部分摘要进旧历史。
     pub recent_max_tokens: u32,
@@ -239,7 +242,8 @@ impl Default for ChatConfig {
             estimate_ratio: 1.15,
             decider: false,
             history_target_tokens: 8192,
-            ignore_star: true,
+            ignore_prefix_enabled: true,
+            ignore_prefix: "*".into(),
             recent_max_tokens: 3000,
             recent_keep_msgs: 10,
             memory: MemoryConfig::default(),

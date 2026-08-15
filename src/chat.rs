@@ -169,6 +169,9 @@ pub struct HistoryMsg {
     /// 稳定 id(与轨迹联动,详情页编辑/删除用;旧文件缺省时加载时生成)
     #[serde(default)]
     pub id: String,
+    /// 发送者 QQ(0 = 未知/机器人自身;注入上下文时加 [QQxxx] 前缀,让模型分清说话人)
+    #[serde(default)]
+    pub sender: i64,
 }
 
 pub struct Session {
@@ -243,6 +246,7 @@ impl Session {
                     ts: 0,
                     tokens: 0,
                     id: String::new(),
+                    sender: 0,
                 };
                 if let Ok(l) = serde_json::to_string(&line) {
                     out.push_str(&l);
@@ -259,8 +263,9 @@ impl Session {
         }
     }
 
-    /// 追加一条并落盘,返回该条 token 估算
-    fn push_id(&mut self, role: &str, text: &str, ratio: f64, id: &str) -> u32 {
+    /// 追加一条并落盘,返回该条 token 估算。
+    /// sender = 发送者 QQ(user 消息);assistant 与摘要传 0。
+    fn push_id(&mut self, role: &str, text: &str, ratio: f64, id: &str, sender: i64) -> u32 {
         let tokens = estimate_tokens(text, ratio);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -272,6 +277,7 @@ impl Session {
             ts,
             tokens,
             id: id.to_string(),
+            sender,
         };
         if let Some(dir) = self.file.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -293,7 +299,7 @@ impl Session {
     #[cfg(test)]
     fn push(&mut self, role: &str, text: &str, ratio: f64) {
         let id = trace::new_id();
-        self.push_id(role, text, ratio, &id);
+        self.push_id(role, text, ratio, &id, 0);
     }
 
     fn clear(&mut self) {
@@ -398,7 +404,7 @@ pub struct ChatCore {
     /// 每群最近一次主动发言时的消息计数(插话冷却,软 at 也会刷新)
     pub interject_at: StdMutex<HashMap<String, u64>>,
     /// 群聊轨迹:未触发对话的普通消息缓冲(key -> (时间, 文本))
-    pub trail: StdMutex<HashMap<String, VecDeque<(SystemTime, String)>>>,
+    pub trail: StdMutex<HashMap<String, VecDeque<(SystemTime, i64, String)>>>,
     /// 会话状态(列表胶囊灯)
     pub status: StdMutex<HashMap<String, SessionStatus>>,
     /// 进行中回复的中止通道(key -> sender)
@@ -582,6 +588,30 @@ impl ChatCore {
             return;
         }
         let key = session_key(&msg);
+        // ① 入口拦截:忽略前缀命中时,无论 @/引用/关键词 一律不处理(仅记录)。
+        //    剥掉开头的引用占位符再判断,引用消息与关键词触发同样被挡。
+        let ignored = {
+            let cfg = self.cfg.read().await;
+            ignore_prefix_hit(&cfg, &msg.text)
+        };
+        if ignored {
+            let turn = trace::new_id();
+            self.emit_msg_in(&key, &msg.text);
+            self.log("info", &format!("[{key}] 忽略前缀消息,不处理: {}", msg.text));
+            self.trace_push(
+                &key,
+                &TraceEvent::MsgIn {
+                    id: None,
+                    turn,
+                    ts: trace::now_ts(),
+                    trigger: "ignored".into(),
+                    text: msg.text.clone(),
+                    ignored: true,
+                },
+            )
+            .await;
+            return;
+        }
         // 每会话串行门(跨会话并行):同群消息严格保序,不同群/私聊互不阻塞
         let gate = self.get_gate(&key).await;
         let _gate = gate.lock().await;
@@ -611,24 +641,6 @@ impl ChatCore {
         let win_min = cfg.chat.interject.activity_window_minutes.max(1);
         self.track_activity(&key, win_min * 60);
 
-        // * 前缀消息:完全忽略(不回复、不入历史、不触发),给群友自由交流空间
-        if cfg.chat.ignore_star && msg.text.trim_start().starts_with('*') {
-            self.log("info", &format!("[{key}] * 前缀消息,忽略: {}", msg.text));
-            self.trace_push(
-                &key,
-                &TraceEvent::MsgIn {
-                    id: None,
-                    turn,
-                    ts: trace::now_ts(),
-                    trigger: "ignored".into(),
-                    text: msg.text.clone(),
-                    ignored: true,
-                },
-            )
-            .await;
-            return;
-        }
-
         // 斜杠命令:群聊/私聊均可直接触发,跳过决策器(命令绝不因决策器被吞)
         let is_cmd = msg.text.trim_start().starts_with('/');
         if is_cmd {
@@ -648,7 +660,7 @@ impl ChatCore {
             } else {
                 "消息包含触发关键词"
             };
-            if self.decider_ok(&key, &turn, &msg.text, hint).await {
+            if self.decider_ok(&key, &turn, &msg.text, hint, msg.user_id).await {
                 self.full_dialogue(&key, &msg, &turn).await;
             } else {
                 self.log("info", &format!("[{key}] 决策器:无需回复(被动触发)"));
@@ -670,7 +682,7 @@ impl ChatCore {
         // ② 软 at(提到机器人称呼)→ 完整通道,必回,刷新插话冷却(决策器通过才回复)
         if msg.kind == MsgKind::Group && trigger::soft_at_hit(&cfg, &msg.text) {
             drop(cfg);
-            if self.decider_ok(&key, &turn, &msg.text, "消息提到了你的称呼").await {
+            if self.decider_ok(&key, &turn, &msg.text, "消息提到了你的称呼", msg.user_id).await {
                 self.mark_interjected(&key);
                 self.log("info", &format!("[{key}] 软 at 触发(称呼提及)"));
                 self.full_dialogue(&key, &msg, &turn).await;
@@ -698,7 +710,7 @@ impl ChatCore {
             && self.interject_sample(&key, &user_text).await
         {
             drop(cfg);
-            if self.decider_ok(&key, &turn, &user_text, "主动插话采样命中(是否接话)").await {
+            if self.decider_ok(&key, &turn, &user_text, "主动插话采样命中(是否接话)", msg.user_id).await {
                 self.log("info", &format!("[{key}] 主动插话: {user_text}"));
                 // 完整上下文开关:开启后插话走完整通道(历史/记忆/轨迹按设置注入,并记入历史);
                 // 关闭则走轻量通道(单轮、不落盘)。完整通道的消息不进轨迹,避免重复注入。
@@ -709,7 +721,7 @@ impl ChatCore {
                 if full_context {
                     self.full_dialogue(&key, &msg, &turn).await;
                 } else {
-                    self.record_trail(&key, &msg.text).await;
+                    self.record_trail(&key, &msg.text, msg.user_id).await;
                     self.light_reply(&msg, &user_text, &turn).await;
                 }
             } else {
@@ -733,7 +745,7 @@ impl ChatCore {
             // 全部触发条件未命中:记录群聊轨迹(解决"鱼的记忆"),并写入时间线
             // (修复:此前未触发消息不进轨迹文件,详情页看不到,显得"被吞掉")
             self.log("debug", &format!("[{key}] 未触发回复逻辑: {}", msg.text));
-            self.record_trail(&key, &msg.text).await;
+            self.record_trail(&key, &msg.text, msg.user_id).await;
             self.trace_push(
                 &key,
                 &TraceEvent::MsgIn {
@@ -765,7 +777,7 @@ impl ChatCore {
     /// window 模式按 window_minutes 保留;all / triggered_only 保留 24 小时。
     /// all 模式不设条数上限(用户显式选择「全部注入,无上限」);
     /// triggered_only 仍以 max_entries 作为缓冲安全上限。
-    async fn record_trail(&self, key: &str, text: &str) {
+    async fn record_trail(&self, key: &str, text: &str, sender: i64) {
         if !key.starts_with('g') {
             return;
         }
@@ -780,13 +792,13 @@ impl ChatCore {
         let window_secs = if mode == "window" { win } else { 86400 };
         // all 模式:max_entries 传 0 表示不设条数上限
         let max_entries = if mode == "all" { 0 } else { max };
-        self.trail_push(key, text, window_secs, max_entries);
+        self.trail_push(key, text, sender, window_secs, max_entries);
     }
 
     /// 决策器:开启时由当前模型判断这条消息是否需要回复。
     /// 关闭 / 无模型 / 决策调用失败 → 按需要回复处理(保守,不漏回消息)。
     /// trigger_hint 说明消息的触发方式(修复:决策器此前看不到 @ 信息,把召唤消息误判为闲聊)
-    async fn decider_ok(&self, key: &str, turn: &str, text: &str, trigger_hint: &str) -> bool {
+    async fn decider_ok(&self, key: &str, turn: &str, text: &str, trigger_hint: &str, sender: i64) -> bool {
         let (enabled, model, prompt) = {
             let cfg = self.cfg.read().await;
             (
@@ -806,7 +818,7 @@ impl ChatCore {
         // 全局暂停时中止决策请求(select 丢弃 future 即取消 HTTP 请求)
         let mut cancel_rx = self.decide_cancel.subscribe();
         let result = tokio::select! {
-            r = self.llm.decide(&model, &prompt, text, trigger_hint) => Some(r),
+            r = self.llm.decide(&model, &prompt, text, trigger_hint, sender) => Some(r),
             _ = cancel_rx.changed() => None,
         };
         self.set_status(key, SessionStatus::Idle).await;
@@ -957,7 +969,7 @@ impl ChatCore {
 
         // 先落用户消息(即使模型失败也在历史里),再记轨迹
         let user_id = trace::new_id();
-        let user_tokens = session.push_id("user", &user_text, ratio, &user_id) as f64;
+        let user_tokens = session.push_id("user", &user_text, ratio, &user_id, msg.user_id) as f64;
         self.emit_session(key, &session).await;
         self.trace_push(
             key,
@@ -1056,7 +1068,7 @@ impl ChatCore {
                 let send_result = self.send_text(msg, &out).await;
                 // 落盘助手消息 + 轨迹(发送失败也记录真实输出)
                 let assistant_id = trace::new_id();
-                let assistant_tokens = session.push_id("assistant", &out, ratio, &assistant_id) as f64;
+                let assistant_tokens = session.push_id("assistant", &out, ratio, &assistant_id, 0) as f64;
                 self.emit_session(key, &session).await;
                 self.trace_push(
                     key,
@@ -1284,7 +1296,12 @@ impl ChatCore {
         for h in &session.history {
             msgs.push(ApiMessage {
                 role: h.role.clone(),
-                content: h.text.clone(),
+                // user 消息带发送者前缀,模型能分清谁说了什么
+                content: if h.role == "user" && h.sender > 0 {
+                    format!("{}{}", speaker_prefix(h.sender), h.text)
+                } else {
+                    h.text.clone()
+                },
             });
         }
         if mem_cfg.placement == "back" {
@@ -1331,7 +1348,7 @@ impl ChatCore {
         }
         msgs.push(ApiMessage {
             role: "user".into(),
-            content: user_text.to_string(),
+            content: format!("{}{}", speaker_prefix(msg.user_id), user_text),
         });
         msgs
     }
@@ -1359,7 +1376,7 @@ impl ChatCore {
             },
             ApiMessage {
                 role: "user".into(),
-                content: user_text.to_string(),
+                content: format!("{}{}", speaker_prefix(msg.user_id), user_text),
             },
         ];
         let started = Instant::now();
@@ -1970,7 +1987,7 @@ impl ChatCore {
 
     /// 记录群聊轨迹(未触发对话的消息),按窗口与条数限制。
     /// max_entries == 0 表示不设条数上限(「全部注入」模式)。
-    fn trail_push(&self, key: &str, text: &str, window_secs: u64, max_entries: usize) {
+    fn trail_push(&self, key: &str, text: &str, sender: i64, window_secs: u64, max_entries: usize) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -1978,12 +1995,12 @@ impl ChatCore {
         let mut m = self.trail.lock().unwrap();
         let q = m.entry(key.to_string()).or_default();
         let now = SystemTime::now();
-        q.retain(|(t, _)| {
+        q.retain(|(t, _, _)| {
             now.duration_since(*t)
                 .map(|d| d.as_secs() < window_secs)
                 .unwrap_or(false)
         });
-        q.push_back((now, text.to_string()));
+        q.push_back((now, sender, text.to_string()));
         if max_entries > 0 {
             while q.len() > max_entries {
                 q.pop_front();
@@ -2054,7 +2071,7 @@ impl ChatCore {
                     {
                         let now = SystemTime::now();
                         self.trail.lock().unwrap().retain(|_, q| {
-                            q.retain(|(t, _)| {
+                            q.retain(|(t, _, _)| {
                                 now.duration_since(*t)
                                     .map(|d| d.as_secs() < 86400)
                                     .unwrap_or(false)
@@ -2285,14 +2302,14 @@ fn pseudo_random() -> f64 {
 /// 渲染群聊轨迹为一条 user 消息内容(窗口过滤 + 从最新截断到 max_tokens)。
 /// max_tokens == 0 表示不设 token 上限(「全部注入」模式),整段缓冲全部渲染。
 pub fn render_trail(
-    lines: &VecDeque<(SystemTime, String)>,
+    lines: &VecDeque<(SystemTime, i64, String)>,
     window_secs: u64,
     max_tokens: u32,
     ratio: f64,
 ) -> Option<String> {
     let now = SystemTime::now();
     let mut rendered: Vec<String> = Vec::new();
-    for (t, text) in lines {
+    for (t, sender, text) in lines {
         if now
             .duration_since(*t)
             .map(|d| d.as_secs() < window_secs)
@@ -2301,7 +2318,7 @@ pub fn render_trail(
             let hhmm = chrono::DateTime::<chrono::Local>::from(*t)
                 .format("%H:%M")
                 .to_string();
-            rendered.push(format!("[{hhmm}] {text}"));
+            rendered.push(format!("[{hhmm}]{}{text}", speaker_prefix(*sender)));
         }
     }
     if rendered.is_empty() {
@@ -2374,6 +2391,35 @@ pub fn session_key(msg: &ParsedMsg) -> String {
     }
 }
 
+/// 说话人前缀(注入上下文用,让模型分清谁说了什么);sender ≤ 0 时无前缀
+fn speaker_prefix(sender: i64) -> String {
+    if sender > 0 {
+        format!("[QQ{sender}] ")
+    } else {
+        String::new()
+    }
+}
+
+/// 忽略前缀命中判断(入口拦截):剥掉开头的引用占位符(如 [引用回复] / [引用QQ123])后,
+/// 按配置的逗号分隔前缀列表匹配——引用消息与关键词触发同样被挡。
+fn ignore_prefix_hit(cfg: &Config, text: &str) -> bool {
+    if !cfg.chat.ignore_prefix_enabled {
+        return false;
+    }
+    let mut t = text.trim_start();
+    if t.starts_with("[引用") {
+        if let Some(i) = t.find("] ") {
+            t = t[i + 2..].trim_start();
+        }
+    }
+    cfg.chat
+        .ignore_prefix
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .any(|p| t.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2410,13 +2456,14 @@ mod tests {
     fn trail_render() {
         let now = SystemTime::now();
         let lines = vec![
-            (now, "你好".to_string()),
-            (now, "令牌:abc".to_string()),
+            (now, 123, "你好".to_string()),
+            (now, 456, "令牌:abc".to_string()),
         ];
         let out = render_trail(&VecDeque::from(lines.clone()), 300, 800, 1.0).unwrap();
         assert!(out.starts_with("[群聊最近消息]"));
         assert!(out.contains("你好"));
         assert!(out.contains("令牌"));
+        assert!(out.contains("[QQ123]")); // 说话人前缀(模型能分清谁说的)
         assert!(out.contains('[')); // 时间戳格式 [HH:MM]
         // token 上限较小:只保留最新一条(旧的一条放不下)
         let out2 = render_trail(&VecDeque::from(lines.clone()), 300, 10, 1.0).unwrap();
@@ -2428,8 +2475,27 @@ mod tests {
         assert!(out3.contains("令牌"));
         // 过期消息被过滤
         let old = now - Duration::from_secs(600);
-        let lines2 = vec![(old, "过期".to_string())];
+        let lines2 = vec![(old, 123, "过期".to_string())];
         assert!(render_trail(&VecDeque::from(lines2), 300, 800, 1.0).is_none());
+    }
+
+    #[test]
+    fn ignore_prefix_entry_interception() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.chat.ignore_prefix, "*");
+        // 普通前缀
+        assert!(ignore_prefix_hit(&cfg, "*今晚吃什么"));
+        assert!(ignore_prefix_hit(&cfg, "  * 有空格"));
+        // 引用消息:占位符被剥掉后仍被拦截(修复:引用挡不住星号)
+        assert!(ignore_prefix_hit(&cfg, "[引用回复] *刚才说的"));
+        assert!(ignore_prefix_hit(&cfg, "[引用QQ999] *你们聊啥"));
+        assert!(!ignore_prefix_hit(&cfg, "今晚吃什么"));
+        // 多前缀(逗号分隔)
+        cfg.chat.ignore_prefix = "*,~".into();
+        assert!(ignore_prefix_hit(&cfg, "~别理我"));
+        // 关闭后不拦截
+        cfg.chat.ignore_prefix_enabled = false;
+        assert!(!ignore_prefix_hit(&cfg, "*你好"));
     }
 
     #[test]
@@ -2478,8 +2544,8 @@ mod tests {
         let file = dir.join("g1.jsonl");
         let mut s = Session::new("g1", &dir);
         s.ensure_loaded();
-        s.push_id("user", "你好", 1.0, "id1");
-        s.push_id("assistant", "你好呀", 1.0, "id2");
+        s.push_id("user", "你好", 1.0, "id1", 123);
+        s.push_id("assistant", "你好呀", 1.0, "id2", 0);
         drop(s);
 
         // 改写

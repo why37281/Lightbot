@@ -240,7 +240,8 @@ function bindConfigToForm() {
   $("#cfg-summarize-tokens").value = c.summarize_tokens;
   $("#cfg-clean-hours").value = c.clean_after_hours;
   $("#cfg-est-ratio").value = c.estimate_ratio;
-  $("#cfg-ignore-star").checked = c.ignore_star;
+  $("#cfg-ignore-star").checked = c.ignore_prefix_enabled;
+  $("#cfg-ignore-prefix").value = c.ignore_prefix;
   $("#cfg-wallet").value = cfg.cost.wallet_balance;
   $("#cfg-ui-refresh").value = cfg.ui_refresh_ms;
   $("#cfg-interject").checked = ij.enabled;
@@ -298,7 +299,8 @@ function collectForm() {
   c.summarize_tokens = parseInt($("#cfg-summarize-tokens").value) || 600;
   c.clean_after_hours = parseInt($("#cfg-clean-hours").value) || 0;
   c.estimate_ratio = parseFloat($("#cfg-est-ratio").value) || 1.15;
-  c.ignore_star = $("#cfg-ignore-star").checked;
+  c.ignore_prefix_enabled = $("#cfg-ignore-star").checked;
+  c.ignore_prefix = $("#cfg-ignore-prefix").value.trim() || "*";
   cfg.cost.wallet_balance = parseFloat($("#cfg-wallet").value) || 0;
   cfg.ui_refresh_ms = parseInt($("#cfg-ui-refresh").value) || 500;
   ij.enabled = $("#cfg-interject").checked;

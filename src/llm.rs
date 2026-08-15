@@ -292,10 +292,11 @@ impl LlmClient {
         prompt: &str,
         text: &str,
         trigger_hint: &str,
+        sender: i64,
     ) -> Result<(bool, Usage), String> {
         let mut m2 = m.clone();
         m2.max_tokens = 32;
-        let msgs = build_decide_messages(prompt, text, trigger_hint);
+        let msgs = build_decide_messages(prompt, text, trigger_hint, sender);
         let reply = self.chat(&m2, &msgs, Some(32)).await?;
         Ok((parse_decision(&reply.text), reply.usage))
     }
@@ -428,10 +429,20 @@ impl StreamedChat {
 
 /// 构造决策请求的消息(独立函数:便于测试与定位决策提示词)。
 ///
-/// 关键设计:用户消息带「触发说明」——决策器必须知道这条消息是怎么触发机器人的
-/// (@ / 引用 / 私聊 / 关键词 / 称呼 / 插话采样),否则 @ 段被剥掉后它只会看到裸文本,
-/// 把所有消息都误判为「纯闲聊」。
-pub fn build_decide_messages(prompt: &str, text: &str, trigger_hint: &str) -> Vec<ApiMessage> {
+/// 关键设计:用户消息带「发送者」与「触发说明」——决策器必须知道消息是谁发的、
+/// 是怎么触发机器人的(@ / 引用 / 私聊 / 关键词 / 称呼 / 插话采样),否则 @ 段被剥掉后
+/// 它只会看到裸文本,把所有消息都误判为「纯闲聊」。
+pub fn build_decide_messages(
+    prompt: &str,
+    text: &str,
+    trigger_hint: &str,
+    sender: i64,
+) -> Vec<ApiMessage> {
+    let mut user = String::new();
+    if sender > 0 {
+        user.push_str(&format!("【发送者 QQ:{sender}】\n"));
+    }
+    user.push_str(&format!("【触发说明:{trigger_hint}】\n{text}"));
     vec![
         ApiMessage {
             role: "system".into(),
@@ -445,7 +456,7 @@ pub fn build_decide_messages(prompt: &str, text: &str, trigger_hint: &str) -> Ve
         },
         ApiMessage {
             role: "user".into(),
-            content: format!("【触发说明:{trigger_hint}】\n{text}"),
+            content: user,
         },
     ]
 }
@@ -477,13 +488,17 @@ mod tests {
 
     #[test]
     fn decide_messages_include_trigger_hint() {
-        let msgs = build_decide_messages("人设", "你好", "对方 @ 了你");
+        let msgs = build_decide_messages("人设", "你好", "对方 @ 了你", 67890);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
         assert!(msgs[0].content.contains("人设"));
         assert!(msgs[0].content.contains("需要回复"));
-        assert!(msgs[1].content.starts_with("【触发说明:对方 @ 了你】"));
+        assert!(msgs[1].content.starts_with("【发送者 QQ:67890】"));
+        assert!(msgs[1].content.contains("【触发说明:对方 @ 了你】"));
         assert!(msgs[1].content.contains("你好"));
+        // 未知发送者(0)不注入发送者行
+        let msgs2 = build_decide_messages("人设", "hi", "私聊", 0);
+        assert!(!msgs2[1].content.contains("发送者"));
     }
 
     #[test]

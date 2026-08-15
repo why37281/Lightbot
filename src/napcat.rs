@@ -247,21 +247,32 @@ fn extract_text(msg: &Value, self_id: Option<i64>) -> (String, bool, bool) {
                     "text" => text.push_str(data["text"].as_str().unwrap_or("")),
                     "at" => {
                         let qq = data["qq"].as_str().unwrap_or("");
-                        match self_id {
-                            Some(sid) => {
-                                if qq == sid.to_string() || qq == "all" {
-                                    at_me = true;
-                                }
-                            }
-                            None => at_me = true,
-                        }
                         if qq == "all" {
+                            // @全体:触发,并保留文本
+                            at_me = true;
                             text.push_str("@全体成员 ");
+                        } else if !qq.is_empty() {
+                            // 修复:@ 特定成员时只在目标是机器人时触发;@ 别人保留目标文本
+                            // (模型能分清"别人 @ 的是谁";@ 自己不加文本,避免破坏命令检测)
+                            if self_id.map(|s| s.to_string() == qq).unwrap_or(false) {
+                                at_me = true;
+                            } else {
+                                text.push_str(&format!("@QQ{qq} "));
+                            }
                         }
+                        // self_id 未知:特定 @ 一律不假定为 @ 机器人(修复误触发)
                     }
                     "reply" => {
-                        reply_me = true;
-                        text.push_str("[引用回复] ");
+                        // 修复:只有引用(回复)机器人自己的消息才触发;引用别人保留目标文本
+                        let quoted = data["qq"].as_str().and_then(|q| q.parse::<i64>().ok());
+                        match (quoted, self_id) {
+                            (Some(q), Some(sid)) if q == sid => {
+                                reply_me = true;
+                                text.push_str("[引用回复] ");
+                            }
+                            (Some(q), _) => text.push_str(&format!("[引用QQ{q}] ")),
+                            (None, _) => text.push_str("[引用] "),
+                        }
                     }
                     "image" => text.push_str("[图片] "),
                     "face" => text.push_str("[表情] "),
@@ -310,21 +321,27 @@ fn extract_text(msg: &Value, self_id: Option<i64>) -> (String, bool, bool) {
                     match t {
                         "at" => {
                             let qq = get("qq=");
-                            match self_id {
-                                Some(sid) => {
-                                    if qq == sid.to_string() || qq == "all" {
-                                        at_me = true;
-                                    }
-                                }
-                                None => at_me = true,
-                            }
                             if qq == "all" {
+                                at_me = true;
                                 text.push_str("@全体成员 ");
+                            } else if !qq.is_empty() {
+                                if self_id.map(|s| s.to_string() == qq).unwrap_or(false) {
+                                    at_me = true;
+                                } else {
+                                    text.push_str(&format!("@QQ{qq} "));
+                                }
                             }
                         }
                         "reply" => {
-                            reply_me = true;
-                            text.push_str("[引用回复] ");
+                            let quoted = get("qq=").parse::<i64>().ok();
+                            match (quoted, self_id) {
+                                (Some(q), Some(sid)) if q == sid => {
+                                    reply_me = true;
+                                    text.push_str("[引用回复] ");
+                                }
+                                (Some(q), _) => text.push_str(&format!("[引用QQ{q}] ")),
+                                (None, _) => text.push_str("[引用] "),
+                            }
                         }
                         "image" => text.push_str("[图片] "),
                         "face" => text.push_str("[表情] "),
@@ -852,6 +869,63 @@ mod tests {
         let m = parse_message(&v, Some(789));
         assert!(m.at_me);
         assert_eq!(m.text, "hello[表情]");
+    }
+
+    #[test]
+    fn at_others_and_reply_targets() {
+        // @ 别人:不触发,保留 @ 目标文本(模型能分清 @ 的是谁)
+        let v = json!({
+            "message_type": "group", "group_id": 1, "user_id": 2,
+            "message": [
+                {"type": "at", "data": {"qq": "999"}},
+                {"type": "text", "data": {"text": "在吗"}}
+            ]
+        });
+        let m = parse_message(&v, Some(789));
+        assert!(!m.at_me);
+        assert_eq!(m.text, "@QQ999 在吗");
+
+        // self_id 未知:@ 特定成员不再假定触发(修复误触发);@全体仍触发
+        assert!(!parse_message(&v, None).at_me);
+        let v_all = json!({
+            "message_type": "group", "group_id": 1, "user_id": 2,
+            "message": [{"type": "at", "data": {"qq": "all"}}, {"type": "text", "data": {"text": "hi"}}]
+        });
+        assert!(parse_message(&v_all, None).at_me);
+
+        // 引用机器人自己的消息:触发
+        let vq1 = json!({
+            "message_type": "group", "group_id": 1, "user_id": 2,
+            "message": [{"type": "reply", "data": {"id": "1", "qq": "789"}}, {"type": "text", "data": {"text": "收到"}}]
+        });
+        let mq = parse_message(&vq1, Some(789));
+        assert!(mq.reply_me);
+        assert_eq!(mq.text, "[引用回复] 收到");
+
+        // 引用别人的消息:不触发,保留引用目标(修复:此前任何引用都算引用机器人)
+        let vq2 = json!({
+            "message_type": "group", "group_id": 1, "user_id": 2,
+            "message": [{"type": "reply", "data": {"id": "1", "qq": "999"}}, {"type": "text", "data": {"text": "收到"}}]
+        });
+        let mq2 = parse_message(&vq2, Some(789));
+        assert!(!mq2.reply_me);
+        assert_eq!(mq2.text, "[引用QQ999] 收到");
+
+        // 引用数据缺少 qq:不假定触发
+        let vq3 = json!({
+            "message_type": "group", "group_id": 1, "user_id": 2,
+            "message": [{"type": "reply", "data": {"id": "1"}}, {"type": "text", "data": {"text": "hi"}}]
+        });
+        assert!(!parse_message(&vq3, Some(789)).reply_me);
+
+        // CQ 字符串:引用别人
+        let vc = json!({
+            "message_type": "group", "group_id": 1, "user_id": 2,
+            "message": "[CQ:reply,id=1,qq=999]hello"
+        });
+        let mc = parse_message(&vc, Some(789));
+        assert!(!mc.reply_me);
+        assert_eq!(mc.text, "[引用QQ999] hello");
     }
 
     #[test]

@@ -277,8 +277,11 @@
       </div>
       <h3>消息忽略与费用预算</h3>
       <div class="form-grid narrow">
-        <label class="check">忽略 * 前缀消息(QQ 消息以 * 开头时不回复、不入历史)
+        <label class="check">忽略前缀消息(入口拦截:不回复、不入历史,引用/关键词也挡得住)
           <input id="cfg-ignore-star" type="checkbox" />
+        </label>
+        <label>忽略前缀(逗号分隔多个)
+          <input id="cfg-ignore-prefix" type="text" placeholder="*" />
         </label>
         <label>钱包余额(元,手动填写;面板显示「余额 − 今日费用」)
           <input id="cfg-wallet" type="number" step="0.01" min="0" />
@@ -292,7 +295,7 @@
         <span id="balance-result" class="result"></span>
       </div>
       <div class="tips">
-        <p>💡 * 前缀消息完全绕过模型(不回复、不触发、不占上下文),只在日志与会话详情里留痕——群友可以自由用 <code>*xxx</code> 闲聊而不会被机器人接话。</p>
+        <p>💡 忽略前缀在<b>消息入口</b>拦截:命中时无论 @/引用/关键词都不处理(引用占位符会被先剥掉再判断),只在日志与会话详情里留痕——群友可以自由用 <code>*xxx</code> 闲聊而不会被机器人接话。前缀可改成任意字符(逗号分隔多个)。</p>
         <p>💡 「查询余额」调用 DeepSeek 官方 <code>GET /user/balance</code>,成功后自动把总余额填入上方钱包余额(需点「保存配置」才会落盘)。</p>
         <p>💡 每个模型的输入(命中/未命中)与输出单价在「模型设置」的模型卡片里填写(元 / 百万 tokens)。DeepSeek 近期多次调价,请以官方定价页为准:https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ 。内置默认:V4-Flash 0.02 / 1 / 2,V4-Pro 0.025 / 3 / 6。</p>
       </div>
