@@ -240,6 +240,7 @@ function bindConfigToForm() {
   $("#cfg-est-ratio").value = c.estimate_ratio;
   $("#cfg-ignore-star").checked = c.ignore_star;
   $("#cfg-wallet").value = cfg.cost.wallet_balance;
+  $("#cfg-ui-refresh").value = cfg.ui_refresh_ms;
   $("#cfg-interject").checked = ij.enabled;
   $("#cfg-interject-mode").value = ij.mode;
   $("#cfg-interject-cooldown").value = ij.cooldown_messages;
@@ -297,6 +298,7 @@ function collectForm() {
   c.estimate_ratio = parseFloat($("#cfg-est-ratio").value) || 1.15;
   c.ignore_star = $("#cfg-ignore-star").checked;
   cfg.cost.wallet_balance = parseFloat($("#cfg-wallet").value) || 0;
+  cfg.ui_refresh_ms = parseInt($("#cfg-ui-refresh").value) || 500;
   ij.enabled = $("#cfg-interject").checked;
   ij.mode = $("#cfg-interject-mode").value;
   ij.cooldown_messages = parseInt($("#cfg-interject-cooldown").value) || 25;
@@ -360,6 +362,7 @@ $("#btn-save").addEventListener("click", async () => {
     renderPrompts();
     renderOverview();
     refreshCost();
+    startEventPoller(); // 刷新间隔可能已变更,按新值重启轮询
   } catch (e) {
     setResult(String(e), "err");
     addLog("error", "保存配置失败: " + e);
