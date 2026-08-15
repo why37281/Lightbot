@@ -49,6 +49,7 @@ pub const THINKING_GUIDE: &str = "(思考过程请保持简短:只需要确定�
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)] // TurnDelta 等变体为将来扩展保留
 pub enum FrontendEvent {
     Log { level: String, msg: String },
     Status { status: ConnStatus },
