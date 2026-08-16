@@ -28,6 +28,8 @@ pub type PendingMsg = (ParsedMsg, String);
 pub struct SessionState {
     /// 会话状态(列表胶囊灯)
     pub status: SessionStatus,
+    /// 会话级暂停(/pause 设置):仅接收消息,不决策不回复(重启后复位,与全局暂停一致)
+    pub paused: bool,
     /// 进行中回复的直播缓冲(前端轮询兜底)
     pub live: Option<LiveTurn>,
     /// 进行中回复的中止通道
@@ -89,6 +91,26 @@ impl SessionRegistry {
             .get(key)
             .map(|s| s.status)
             .unwrap_or(SessionStatus::Idle)
+    }
+
+    // ---------- 会话级暂停 ----------
+
+    /// 设置会话暂停(/pause、/resume);返回是否发生了变化
+    pub fn set_session_paused(&self, key: &str, paused: bool) -> bool {
+        self.with(key, |st| {
+            let changed = st.paused != paused;
+            st.paused = paused;
+            changed
+        })
+    }
+
+    pub fn is_session_paused(&self, key: &str) -> bool {
+        self.states
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|s| s.paused)
+            .unwrap_or(false)
     }
 
     // ---------- 直播缓冲 ----------
@@ -297,11 +319,12 @@ impl SessionRegistry {
             st.pending.clear();
         }
         // 活跃窗口为空且没有任何留存价值的会话状态整个移除
-        // (保留有累计计数或轨迹的,防止插话冷却被意外重置)
+        // (保留有累计计数、轨迹或暂停标志的,防止插话冷却被意外重置、暂停状态被清理丢掉)
         m.retain(|_, st| {
             !st.activity.is_empty()
                 || st.msg_count > 0
                 || !st.trail.is_empty()
+                || st.paused
                 || st.status != SessionStatus::Idle
                 || st.live.is_some()
                 || st.abort.is_some()
@@ -393,6 +416,23 @@ mod tests {
         assert_eq!(rt.interject_since("g1"), Some(0));
         rt.track_activity("g1", 60);
         assert_eq!(rt.interject_since("g1"), Some(1));
+    }
+
+    #[test]
+    fn session_pause_survives_cleanup() {
+        let rt = SessionRegistry::new();
+        assert!(!rt.is_session_paused("g1"));
+        assert!(rt.set_session_paused("g1", true));   // 变化返回 true
+        assert!(!rt.set_session_paused("g1", true));  // 重复设置无变化
+        assert!(rt.is_session_paused("g1"));
+        // 周期清理不得清除暂停标志(用户显式设置的状态)
+        rt.cleanup();
+        assert!(rt.is_session_paused("g1"));
+        assert!(rt.set_session_paused("g1", false));
+        assert!(!rt.is_session_paused("g1"));
+        // 解除后且无其他留存价值,条目可被清理回收
+        rt.cleanup();
+        assert!(!rt.is_session_paused("g1"));
     }
 
     #[test]

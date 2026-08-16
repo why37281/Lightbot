@@ -641,6 +641,7 @@ const STATUS_META = {
   deciding:  { label: "决策中", cls: "st-deciding" },
   executing: { label: "执行中", cls: "st-executing" },
   approval:  { label: "审批中", cls: "st-approval" },
+  paused:    { label: "⏸ 已暂停", cls: "st-idle" }, // 会话级暂停(/pause),优先于运行状态显示
 };
 
 function statusCapsule(status) {
@@ -685,8 +686,10 @@ async function refreshSessions() {
           </span>
         </span>
       </td>`;
-    tr.querySelector(".status-cell").appendChild(statusCapsule(s.status || "idle"));
-    tr.querySelector(".status-cell").dataset.status = s.status || "idle";
+    // 会话级暂停(/pause)优先于运行状态显示
+    const st = s.paused ? "paused" : (s.status || "idle");
+    tr.querySelector(".status-cell").appendChild(statusCapsule(st));
+    tr.querySelector(".status-cell").dataset.status = st;
     // 整行可点开详情页;按钮单独处理(不冒泡)
     tr.addEventListener("click", () => openSessionDetail(s.key));
     tr.querySelector(".clear-session").addEventListener("click", async (e) => {
@@ -1276,7 +1279,8 @@ function patchSessionRow(s) {
   const row = tbody.querySelector(`tr[data-key="${CSS.escape(s.key)}"]`);
   if (!row) { refreshSessions(); return; }
   const tds = row.children; // 状态(0) 会话(1) 消息数(2) tokens(3) 摘要(4) 操作(5)
-  const want = s.status || "idle";
+  // 会话级暂停(/pause)优先于运行状态显示
+  const want = s.paused ? "paused" : (s.status || "idle");
   if (tds[0].dataset.status !== want) {
     tds[0].dataset.status = want;
     tds[0].innerHTML = "";

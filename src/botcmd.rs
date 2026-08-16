@@ -52,6 +52,22 @@ impl ChatCore {
                         .unwrap_or("")
                 )
             }
+            "/pause" => {
+                if self.rt.set_session_paused(&session.key, true) {
+                    self.log("info", &format!("[{}] 会话级暂停:仅接收消息", session.key));
+                    "⏸ 本会话已暂停回复,仅接收消息。发送 /resume 恢复。".to_string()
+                } else {
+                    "本会话已经在暂停状态了。".to_string()
+                }
+            }
+            "/resume" => {
+                if self.rt.set_session_paused(&session.key, false) {
+                    self.log("info", &format!("[{}] 会话级暂停已解除", session.key));
+                    "▶ 本会话已恢复回复。".to_string()
+                } else {
+                    "本会话没有在暂停状态。".to_string()
+                }
+            }
             _ => {
                 if let Some(rest) = text.strip_prefix("/remember ") {
                     let content = rest.trim();

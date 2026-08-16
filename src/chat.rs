@@ -244,6 +244,33 @@ impl ChatCore {
             return;
         }
 
+        // 会话级暂停(/pause 设置):仅本会话只接收,不决策、不回复、不思考。
+        // 只放行 /pause 与 /resume 本身——否则暂停后无法恢复,且未知斜杠命令
+        // 会借道命令通道触发 LLM 对话,破坏「仅接收」语义。
+        {
+            let t = msg.text.trim();
+            let pause_ctrl = t == "/pause" || t == "/resume";
+            if self.rt.is_session_paused(&key) && !pause_ctrl {
+                self.log(
+                    "info",
+                    &format!("[{key}] 本会话已暂停回复(/pause),仅接收: {}", msg.text),
+                );
+                self.trace_push(
+                    &key,
+                    &TraceEvent::MsgIn {
+                        id: None,
+                        turn,
+                        ts: trace::now_ts(),
+                        trigger: "paused".into(),
+                        text: msg.text.clone(),
+                        ignored: true,
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+
         let cfg = self.cfg.read().await.clone();
         // 活跃度窗口(可配置,默认 2 分钟)
         let win_min = cfg.chat.interject.activity_window_minutes.max(1);
@@ -1148,6 +1175,8 @@ impl ChatCore {
                 item["has_summary"] = json!(has_summary);
             }
             item["status"] = json!(self.get_status(&key).as_str());
+            // 会话级暂停(/pause):列表显示独立于运行状态灯
+            item["paused"] = json!(self.rt.is_session_paused(&key));
         }
         list
     }
