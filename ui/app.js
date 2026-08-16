@@ -3,7 +3,7 @@
 // 结构:
 //   1. 工具与全局状态
 //   2. 主题 / 面板切换 / 日志
-//   3. 事件总线(后端 frontend 事件 → 视图)
+//   3. 事件总线与统一刷新循环(单 tick:事件 → dirty 标志 → 面板刷新 + 慢速对账)
 //   4. 配置表单绑定与保存 / 模型 / 人设
 //   5. 会话列表(状态胶囊)与记忆管理
 //   6. 总览(缓存统计 + 今日开销面板)
@@ -19,6 +19,7 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 // ---------- 1. 全局状态 ----------
 let cfg = null;            // 当前配置副本
 let running = false;       // 机器人运行中
+let paused = false;        // 全局暂停回复(仅接收消息)
 let stats = { hit: 0, miss: 0, last: null }; // 本次运行缓存统计累计
 const logs = [];           // 日志行 {ts, level, msg}
 
@@ -95,10 +96,22 @@ function renderLogs() {
 $("#log-level").addEventListener("change", renderLogs);
 $("#btn-clear-log").addEventListener("click", () => { logs.length = 0; renderLogs(); });
 
-// ---------- 3. 事件总线(拉模式) ----------
+// ---------- 3. 事件总线与统一刷新循环 ----------
 // 事件走 get_events 轮询拉取(推送链路在部分环境下不可用,invoke 已被证明可靠)。
-// 轮询间隔可配置(cfg.ui_refresh_ms,默认 500ms)。
+//
+// 刷新模型(单循环,替代旧的「事件轮询 + 详情防抖定时器 + 1.5s 全量轮询」三路并行):
+//   tick() 每 ui_refresh_ms 执行一次:
+//     1. 拉事件 → handleEvent 只置各面板 dirty 标志(同一 tick 内多次事件合并为一次刷新);
+//     2. 按 dirty 标志刷新对应面板(会话列表 / 详情页);
+//     3. 每 8s 慢速对账一次(get_status_view + 会话列表原位修补),自愈任何漂移。
+//   所有面板 DOM 只有一个写入者(tick),不再有并发竞争写同一 DOM 的时序问题。
 let lastEventSeq = 0;
+const tickState = {
+  inFlight: false,        // 上一次 tick 未完成时不叠加(网络慢时自然降频)
+  dirtySessions: false,   // session_changed 事件 → 会话列表待刷新
+  dirtyDetail: false,     // trace 事件 → 详情页待增量渲染
+  lastSlowSync: 0,        // 上次慢速对账时间
+};
 
 async function fetchEvents() {
   try {
@@ -112,14 +125,37 @@ async function fetchEvents() {
   } catch (e) { /* 忽略 */ }
 }
 
-let eventPollTimer = null;
-function startEventPoller() {
-  if (eventPollTimer) clearInterval(eventPollTimer);
+let tickTimer = null;
+function startTickLoop() {
+  if (tickTimer) clearInterval(tickTimer);
   // 无最小值限制(仅要求为正数,否则回落默认 500);保留 5000 上限防误填
   const raw = parseInt(cfg?.ui_refresh_ms);
   const ms = Math.min(5000, raw > 0 ? raw : 500);
-  eventPollTimer = setInterval(fetchEvents, ms);
-  fetchEvents(); // 立即拉一次
+  tickTimer = setInterval(tick, ms);
+  tick(); // 立即执行一次
+}
+
+async function tick() {
+  if (tickState.inFlight) return;
+  tickState.inFlight = true;
+  try {
+    await fetchEvents();
+    if (tickState.dirtySessions) {
+      tickState.dirtySessions = false;
+      await syncSessions();
+    }
+    if (detailState.key && tickState.dirtyDetail) {
+      tickState.dirtyDetail = false;
+      await pollDetail();
+    }
+    // 慢速对账:兜底自愈(状态漂移 / 漏事件 / 会话增删)
+    if (Date.now() - tickState.lastSlowSync >= 8000) {
+      tickState.lastSlowSync = Date.now();
+      await slowSync();
+    }
+  } finally {
+    tickState.inFlight = false;
+  }
 }
 
 function handleEvent(ev) {
@@ -143,8 +179,9 @@ function handleEvent(ev) {
       break;
     }
     case "session_changed":
-      refreshSessions();
-      // 详情页打开时同步条数/tokens
+      // 合并刷新:同一 tick 内的多条事件只触发一次列表同步
+      tickState.dirtySessions = true;
+      // 详情页打开时同步条数/tokens(轻量直接更新)
       if (detailState.key === ev.key) {
         $("#detail-meta").textContent = `${ev.count} 条消息 · 约 ${(ev.tokens || 0).toLocaleString()} tokens`;
       }
@@ -155,8 +192,9 @@ function handleEvent(ev) {
       if (detailState.key === ev.key) setDetailStatus(ev.status);
       break;
     }
-    case "trace": handleTraceEvent(ev); break;
-    case "turn_delta": handleTurnDelta(ev); break;
+    case "trace":
+      if (detailState.key && ev.key === detailState.key) tickState.dirtyDetail = true;
+      break;
     case "placement_proposal": showApprovalModal(ev.proposal); break;
   }
 }
@@ -207,7 +245,7 @@ async function loadConfig() {
   await refreshSessions();
   await renderMemories();
   await refreshCost();
-  startEventPoller();
+  startTickLoop();
   // 兜底:启动时若有未处理的切换提案(事件可能已错过),弹窗提醒
   try {
     const p = await invoke("get_placement_proposal");
@@ -366,7 +404,7 @@ $("#btn-save").addEventListener("click", async () => {
     renderPrompts();
     renderOverview();
     refreshCost();
-    startEventPoller(); // 刷新间隔可能已变更,按新值重启轮询
+    startTickLoop(); // 刷新间隔可能已变更,按新值重启循环
   } catch (e) {
     setResult(String(e), "err");
     addLog("error", "保存配置失败: " + e);
@@ -398,22 +436,10 @@ $("#btn-toggle").addEventListener("click", async () => {
     paused = false;
     updatePausedUi();
     btn.textContent = running ? "停止" : "启动";
-    if (running) {
-      // 启动后的过渡状态;稍后主动拉一次真实状态(不依赖事件链路)
-      $("#st-dot").className = "dot yellow";
-      $("#st-text").textContent = "启动中…";
-      setTimeout(async () => {
-        try {
-          const sv = await invoke("get_status_view");
-          if (running) updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error });
-        } catch (e) { /* 忽略 */ }
-      }, 800);
-    } else {
-      $("#st-dot").className = "dot gray";
-      $("#st-text").textContent = "未启动";
-    }
     $("#ov-running").textContent = running ? "运行中" : "未启动";
-    // 启动/停止后刷新会话列表(不依赖事件链路)
+    // 启动/停止后立即对账真实状态(invoke 返回即后端已就绪;后续连接变化由 status 事件驱动)
+    await slowSync();
+    // 刷新会话列表与记忆(不依赖事件链路)
     refreshSessions();
     renderMemories();
   } catch (e) {
@@ -1085,22 +1111,8 @@ $("#btn-detail-stop").addEventListener("click", async () => {
   } catch (e) { alert("操作失败: " + e); }
 });
 
-// 直播:完整轨迹事件 → 触发一次即时详情刷新。
-// 渲染统一走轮询路径(单一路径),避免事件+轮询双路径重复渲染卡片。
-let detailPollTimer = null;
-function scheduleDetailPoll() {
-  if (!detailState.key) return;
-  if (detailPollTimer) return;
-  detailPollTimer = setTimeout(() => {
-    detailPollTimer = null;
-    pollDetail();
-  }, 80);
-}
-
-function handleTraceEvent(ev) {
-  if (!detailState.key || ev.key !== detailState.key) return;
-  scheduleDetailPoll();
-}
+// 直播:完整轨迹事件 → handleEvent 置 dirtyDetail,由 tick 统一增量渲染。
+// 渲染统一走 tick 的轮询路径(单一路径),避免事件+轮询双路径重复渲染卡片。
 
 // 收尾直播输出卡片为最终全量文本
 function finalizeOutCard(block, entry) {
@@ -1190,20 +1202,7 @@ function ensureLiveOutCard(turn) {
   return block.outCard;
 }
 
-// 直播:思考/正文增量(事件驱动;QQ 侧并非流式,详情页直播)
-function handleTurnDelta(ev) {
-  if (!detailState.key || ev.key !== detailState.key) return;
-  if (ev.kind === "think") {
-    const { body } = ensureLiveThinkCard(ev.turn);
-    body.textContent += ev.text;
-  } else if (ev.kind === "out") {
-    const { body } = ensureLiveOutCard(ev.turn);
-    body.textContent += ev.text;
-  }
-  $("#detail-timeline").scrollTop = $("#detail-timeline").scrollHeight;
-}
-
-// 轮询兜底:把后端直播缓冲同步到详情页(事件链路异常时流式显示仍可用)
+// 轮询兜底:把后端直播缓冲同步到详情页(由 tick 驱动的 pollDetail 调用)
 function syncLiveTurn(live) {
   if (!live || !detailState.key) return;
   turnBlock(live.turn);
@@ -1253,15 +1252,8 @@ $("#btn-approve-yes").addEventListener("click", async () => {
     if (applied) {
       cfg.chat.memory.placement = applied;
       $("#cfg-mem-placement").value = applied;
-      // 重启后刷新状态
-      setTimeout(async () => {
-        try {
-          const sv = await invoke("get_status_view");
-          running = sv.running;
-          $("#btn-toggle").textContent = running ? "停止" : "启动";
-          updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error });
-        } catch (e) { /* 忽略 */ }
-      }, 1200);
+      // 重启完成后立即对账状态(不再用定时猜测)
+      await slowSync();
     }
   } catch (e) {
     alert("切换失败: " + e);
@@ -1278,7 +1270,7 @@ $("#btn-approve-no").addEventListener("click", async () => {
   } catch (e) { /* 忽略 */ }
 });
 
-// ---------- 实时更新兜底(轮询:即使事件链路异常,列表/详情页也会自动刷新) ----------
+// ---------- 实时更新兜底(tick 的慢速对账分支:即使事件链路异常,列表/详情也会自愈) ----------
 function patchSessionRow(s) {
   const tbody = $("#session-table tbody");
   const row = tbody.querySelector(`tr[data-key="${CSS.escape(s.key)}"]`);
@@ -1296,20 +1288,11 @@ function patchSessionRow(s) {
   if (tds[4].textContent !== sum) tds[4].textContent = sum;
 }
 
-async function pollLive() {
-  if (!running) return;
-  // 暂停状态同步(可能来自其他入口)
-  try {
-    const sv = await invoke("get_status_view");
-    if (!!sv.paused !== paused) {
-      paused = !!sv.paused;
-      updatePausedUi();
-    }
-  } catch (e) { /* 忽略 */ }
+/// 会话列表同步:行数/键集一致时原位修补(不打断 ⋯ 菜单),否则整体重建
+async function syncSessions() {
   let list = [];
   try { list = await invoke("get_sessions"); } catch (e) { return; }
   const tbody = $("#session-table tbody");
-  // 行数与磁盘不一致(新增/删除会话)时整体重建;否则原位修补,避免打断 ⋯ 菜单
   const keys = new Set(list.map((s) => s.key));
   let stale = tbody.children.length !== list.length;
   if (!stale) {
@@ -1317,10 +1300,12 @@ async function pollLive() {
       if (!keys.has(tr.dataset.key)) { stale = true; break; }
     }
   }
-  if (stale) { refreshSessions(); } else {
+  if (stale) {
+    refreshSessions();
+  } else {
     for (const s of list) patchSessionRow(s);
   }
-  // 详情页:状态 + 计数 + 事件/直播缓冲(渲染唯一入口)
+  // 详情页:状态 + 计数 + 事件/直播缓冲
   if (detailState.key) {
     const cur = list.find((x) => x.key === detailState.key);
     if (cur) {
@@ -1328,10 +1313,24 @@ async function pollLive() {
       $("#detail-meta").textContent =
         `${cur.count} 条消息 · 约 ${(cur.tokens || 0).toLocaleString()} tokens${cur.has_summary ? " · 含摘要" : ""}`;
     }
-    await pollDetail();
   }
 }
-setInterval(pollLive, 1500);
+
+/// 慢速对账(每 8s + 启停/审批后立即执行):状态视图与会话列表的自愈兜底
+async function slowSync() {
+  try {
+    const sv = await invoke("get_status_view");
+    running = !!sv.running;
+    paused = !!sv.paused;
+    $("#btn-toggle").textContent = running ? "停止" : "启动";
+    updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error, paused });
+    updatePausedUi();
+    $("#ov-running").textContent = running ? "运行中" : "未启动";
+  } catch (e) { /* 忽略 */ }
+  await syncSessions();
+  // 详情页打开时也顺带拉一次增量(tick 的 dirty 分支之外的兜底)
+  if (detailState.key) await pollDetail();
+}
 
 // ---------- 初始化 ----------
 loadConfig().catch((e) => {

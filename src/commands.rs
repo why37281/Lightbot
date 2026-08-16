@@ -695,7 +695,7 @@ pub async fn approve_placement(
             let cfg = state.config.read().await;
             config::save_config(&state.cfg_path, &cfg)?;
         }
-        let _ = state.events.lock().unwrap().push(FrontendEvent::Log {
+        state.events.lock().unwrap().push(FrontendEvent::Log {
             level: "info".into(),
             msg: format!("记忆位置已切换 -> {to}(自动控制,用户批准)"),
         });

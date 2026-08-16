@@ -102,9 +102,10 @@ pub struct LiveTurn {
 
 /// 会话状态(执行中/审批中为 agent 功能预留的占位状态,当前未启用)
 #[allow(dead_code)]
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
+    #[default]
     Idle,
     Replying,
     Thinking,
@@ -133,12 +134,6 @@ impl SessionStatus {
             SessionStatus::Executing => "执行中",
             SessionStatus::Approval => "审批中",
         }
-    }
-}
-
-impl Default for SessionStatus {
-    fn default() -> Self {
-        SessionStatus::Idle
     }
 }
 
