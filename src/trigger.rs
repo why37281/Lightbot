@@ -274,4 +274,43 @@ mod tests {
         cfg.napcat.keyword = "  , ".into();
         assert!(!passive_hit(&cfg, &msg_group("小灯在吗")));
     }
+
+    #[test]
+    fn ignore_prefix_entry_interception() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.chat.ignore_prefix, "*");
+        // 普通前缀
+        assert!(ignore_prefix_hit(&cfg, "*今晚吃什么"));
+        assert!(ignore_prefix_hit(&cfg, "  * 有空格"));
+        // 引用消息:占位符被剥掉后仍被拦截(修复:引用挡不住星号)
+        assert!(ignore_prefix_hit(&cfg, "[引用回复] *刚才说的"));
+        assert!(ignore_prefix_hit(&cfg, "[引用QQ999] *你们聊啥"));
+        assert!(!ignore_prefix_hit(&cfg, "今晚吃什么"));
+        // 多前缀(逗号分隔)
+        cfg.chat.ignore_prefix = "*,~".into();
+        assert!(ignore_prefix_hit(&cfg, "~别理我"));
+        // 关闭后不拦截
+        cfg.chat.ignore_prefix_enabled = false;
+        assert!(!ignore_prefix_hit(&cfg, "*你好"));
+    }
+}
+
+/// 忽略前缀命中判断(入口拦截):剥掉开头的引用占位符(如 [引用回复] / [引用QQ123])后,
+/// 按配置的逗号分隔前缀列表匹配——引用消息与关键词触发同样被挡。
+pub fn ignore_prefix_hit(cfg: &Config, text: &str) -> bool {
+    if !cfg.chat.ignore_prefix_enabled {
+        return false;
+    }
+    let mut t = text.trim_start();
+    if t.starts_with("[引用") {
+        if let Some(i) = t.find("] ") {
+            t = t[i + 2..].trim_start();
+        }
+    }
+    cfg.chat
+        .ignore_prefix
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .any(|p| t.starts_with(p))
 }

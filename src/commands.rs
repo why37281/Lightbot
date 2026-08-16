@@ -12,9 +12,10 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{self, ChatCore, EventBuf, FrontendEvent};
+use crate::chat::ChatCore;
 use crate::config::{self, Config, ModelConfig};
 use crate::cost::CostTracker;
+use crate::events::{EventBuf, FrontendEvent};
 use crate::llm::LlmClient;
 use crate::memory::MemoryStore;
 use crate::napcat::{BotEvent, ConnStatus, NapcatClient};
@@ -176,6 +177,11 @@ fn validate_config(cfg: &Config) -> Result<(), String> {
 #[tauri::command]
 pub fn get_config_path(state: tauri::State<'_, AppState>) -> String {
     state.cfg_path.display().to_string()
+}
+
+/// 取运行中的对话核心(未运行返回 None;各命令据此走磁盘兜底)
+fn running_chat(state: &tauri::State<'_, AppState>) -> Result<Option<Arc<ChatCore>>, String> {
+    Ok(state.chat.lock().map_err(|e| e.to_string())?.clone())
 }
 
 // ---------- 机器人控制 ----------
@@ -399,18 +405,16 @@ pub async fn test_llm(m: ModelConfig) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn get_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
-    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
-    match chat {
+    match running_chat(&state)? {
         Some(c) => Ok(c.session_list().await),
         // 机器人未运行时也返回磁盘会话,列表不再依赖运行状态
-        None => Ok(chat::scan_session_files(&state.sessions_dir)),
+        None => Ok(crate::session::scan_session_files(&state.sessions_dir)),
     }
 }
 
 #[tauri::command]
 pub async fn clear_session(state: tauri::State<'_, AppState>, key: String) -> Result<(), String> {
-    let chat = state.chat.lock().map(|c| c.clone()).unwrap_or(None);
-    match chat {
+    match running_chat(&state)? {
         Some(c) => {
             c.clear_session(&key).await;
             Ok(())
@@ -422,8 +426,7 @@ pub async fn clear_session(state: tauri::State<'_, AppState>, key: String) -> Re
 /// 清空会话的历史轨迹(详情页时间线),上下文历史不动
 #[tauri::command]
 pub async fn clear_trace(state: tauri::State<'_, AppState>, key: String) -> Result<(), String> {
-    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
-    if let Some(c) = chat {
+    if let Some(c) = running_chat(&state)? {
         return c.clear_trace(&key);
     }
     // 机器人未运行:直接删文件
@@ -438,15 +441,14 @@ pub async fn get_session_detail(
     state: tauri::State<'_, AppState>,
     key: String,
 ) -> Result<Value, String> {
-    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
-    if let Some(c) = chat {
+    if let Some(c) = running_chat(&state)? {
         return Ok(c.session_detail(&key).await);
     }
     // 未运行:磁盘兜底
     let trace_path = state.sessions_dir.join("traces").join(format!("{key}.jsonl"));
     let events = TraceStore::read_all(&trace_path);
     let file = state.sessions_dir.join(format!("{key}.jsonl"));
-    let (count, tokens, has_summary, summary) = chat::read_history_summary(&file);
+    let (count, tokens, has_summary, summary) = crate::session::read_history_summary(&file);
     Ok(serde_json::json!({
         "key": key,
         "status": "idle",
@@ -466,14 +468,13 @@ pub async fn update_history_msg(
     id: String,
     text: String,
 ) -> Result<(), String> {
-    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
-    if let Some(c) = chat {
+    if let Some(c) = running_chat(&state)? {
         return c.update_history_msg(&key, &id, &text).await;
     }
     // 机器人未运行:直接改写磁盘(文件为真相,启动后自然生效)
     let ratio = state.config.read().await.chat.estimate_ratio;
     let file = state.sessions_dir.join(format!("{key}.jsonl"));
-    ChatCore::rewrite_history_entry(&file, &id, &text, ratio)?;
+    crate::session::rewrite_history_entry(&file, &id, &text, ratio)?;
     TraceStore::rewrite_text_by_id(
         &state.sessions_dir.join("traces").join(format!("{key}.jsonl")),
         &id,
@@ -489,13 +490,12 @@ pub async fn delete_history_msg(
     key: String,
     id: String,
 ) -> Result<(), String> {
-    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
-    if let Some(c) = chat {
+    if let Some(c) = running_chat(&state)? {
         return c.delete_history_msg(&key, &id).await;
     }
     // 机器人未运行:直接操作磁盘
     let file = state.sessions_dir.join(format!("{key}.jsonl"));
-    ChatCore::remove_history_entry(&file, &id)?;
+    crate::session::remove_history_entry(&file, &id)?;
     TraceStore::remove_by_id(
         &state.sessions_dir.join("traces").join(format!("{key}.jsonl")),
         &id,
@@ -509,8 +509,7 @@ pub async fn stop_session(
     state: tauri::State<'_, AppState>,
     key: String,
 ) -> Result<bool, String> {
-    let chat = state.chat.lock().map_err(|e| e.to_string())?.clone();
-    match chat {
+    match running_chat(&state)? {
         Some(c) => Ok(c.stop_session(&key)),
         None => Ok(false),
     }

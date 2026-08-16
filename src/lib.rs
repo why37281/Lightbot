@@ -1,12 +1,19 @@
+mod botcmd;
 mod chat;
+mod context;
 mod commands;
 mod config;
 mod cost;
+mod estimate;
+mod events;
+mod interject;
 mod llm;
 mod memory;
 mod napcat;
 mod outbound;
 mod placement;
+mod runtime;
+mod session;
 mod trace;
 mod trigger;
 
@@ -93,7 +100,7 @@ mod tests {
         let napcat = Arc::new(NapcatClient::new(cfg.clone(), ev_tx, status_tx).await);
         let (sender, _conn_task) = napcat.clone().run(cancel.clone()).await;
 
-        let events = Arc::new(std::sync::Mutex::new(crate::chat::EventBuf::new()));
+        let events = Arc::new(std::sync::Mutex::new(crate::events::EventBuf::new()));
         let cost = Arc::new(std::sync::Mutex::new(
             crate::cost::CostTracker::new(std::env::temp_dir().join("lightbot_e2e_usage")),
         ));

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::chat::estimate_tokens;
+use crate::estimate::estimate_tokens;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MemoryEntry {

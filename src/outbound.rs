@@ -83,7 +83,6 @@ pub fn segment_text(text: &str, max_len: usize) -> Vec<String> {
         // 放不下一整行:先封存当前段,再处理本行
         if !cur.is_empty() {
             chunks.push(std::mem::take(&mut cur));
-            cur_len = 0;
         }
         if line_len <= max_len {
             cur.push_str(line);
