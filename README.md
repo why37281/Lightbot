@@ -1,6 +1,9 @@
 # 💡 LightBot — 轻量级 NapCat QQ AI 机器人框架
 
-> 当前版本 **v1.0.0**(首个正式版)。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/why37281/LightBot)
+
+> 当前版本 **v1.0.0**(首个正式版)。仓库:https://github.com/why37281/LightBot · 开源协议:**MIT**
 
 基于 **NapCat(OneBot 11)+ AI 大模型(DeepSeek 等)** 的 QQ 机器人框架,主打:
 

@@ -20,6 +20,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "stream"] }
 chrono = { version = "0.4", features = ["serde"] }
+tauri-plugin-opener = "2.5.4"
 
 [profile.release]
 opt-level = "s"

@@ -128,6 +128,29 @@ function renderLogs() {
 $("#log-level").addEventListener("change", renderLogs);
 $("#btn-clear-log").addEventListener("click", () => { logs.length = 0; renderLogs(); });
 
+// ---------- 2d. 关于(GitHub 仓库链接) ----------
+const REPO_URL = "https://github.com/why37281/LightBot";
+$("#lnk-github").addEventListener("click", async (e) => {
+  e.preventDefault();
+  try {
+    // 经 opener 插件在系统浏览器打开(webview 内直接导航会丢掉应用界面)
+    await invoke("plugin:opener|open_url", { url: REPO_URL });
+  } catch (err) {
+    // 插件不可用时回退:复制链接到剪贴板并提示
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = REPO_URL;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      addLog("info", "仓库链接已复制到剪贴板: " + REPO_URL);
+    } catch (e2) {
+      addLog("warn", "无法打开链接,请手动访问: " + REPO_URL);
+    }
+  }
+});
+
 // ---------- 3. 事件总线与统一刷新循环 ----------
 // 事件走 get_events 轮询拉取(推送链路在部分环境下不可用,invoke 已被证明可靠)。
 //
