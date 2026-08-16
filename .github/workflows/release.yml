@@ -1,0 +1,91 @@
+name: Release
+
+# 推送任意 tag 时触发:双平台构建 release 产物并发布 GitHub Release。
+# 本地(Windows)无法交叉编译 Linux 版:tauri/wry 构建期需要 Linux 侧的
+# webkit2gtk/gtk 系统库与 pkg-config,故 Linux 包在 ubuntu runner 上产出。
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/lightbot.exe dist/LightBot.exe
+          cp README.md LICENSE dist/
+          cd dist && 7z a -tzip LightBot-v1.0-win-x64.zip LightBot.exe README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-x64
+          path: dist/LightBot-v1.0-win-x64.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies (webkit2gtk / gtk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev pkg-config build-essential
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/lightbot dist/LightBot
+          cp README.md LICENSE dist/
+          tar -czf dist/LightBot-v1.0-linux-x64.tar.gz -C dist LightBot README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/LightBot-v1.0-linux-x64.tar.gz
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --verify-tag \
+            --title "v1.0" \
+            --notes "LightBot v1.0 — 首个正式版
+
+          轻量级 NapCat(QQ)AI 机器人框架:Tauri v2 + Rust,单文件几 MB,全 GUI 配置。
+
+          **核心特性**
+          - DeepSeek 上下文缓存优化:人设前缀稳定、历史只追加、截断只删头部(命中部分约 1/50 价格)
+          - 长期记忆(模型自动写入/双位置方案/成本自动切换审批)、群聊轨迹、主动插话、回复决策器
+          - 会话级暂停:\`/pause\` \`/resume\` 只接收不回复;引用回复里发命令同样有效
+          - 会话详情页白盒时间线:消息/思考/决策/回复全流程,可编辑删除、停止本回合
+          - 稳定性:思考模型空正文自动关思考重试、输出清洗(空行折叠)、CQ 码转义防注入、段落边界分段
+          - 今日开销面板(按天落盘、价格快照)与 DeepSeek 余额查询
+
+          **下载**
+          - Windows:\`LightBot-v1.0-win-x64.zip\` — 解压运行 LightBot.exe(系统需 WebView2,Win10/11 一般自带)
+          - Linux:\`LightBot-v1.0-linux-x64.tar.gz\` — 解压后 \`chmod +x LightBot\` 运行(需 webkit2gtk 4.1,主流桌面发行版自带;纯服务器无图形环境不适用)
+
+          首次使用:先配置 NapCat 的正/反向 WS,再在 GUI 里填模型 API Key,详见 README。
+
+          MIT License · https://github.com/why37281/LightBot" \
+            dist/*
