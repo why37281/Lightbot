@@ -41,7 +41,7 @@ use crate::trigger;
 
 /// 记忆管理说明:恒定的独立 system 消息(与开关无关,开关切换不影响缓存前缀)。
 /// ⚠️ 此文本内容改动会破坏缓存前缀,勿随意修改。
-pub const MEMORY_GUIDE: &str = "(你可以管理长期记忆:当你了解到值得长期记住的信息(用户偏好、重要事实、约定)时,在回复末尾用标记 [记忆:添加 内容] 写入;需要删除时用 [记忆:删除 内容片段]。不要写入临时性信息,每次只写最重要的。)";
+pub const MEMORY_GUIDE: &str = "(你可以管理长期记忆:当你了解到值得长期记住的信息(用户偏好、重要事实、约定)时,在回复末尾用标记 [记忆:添加 内容] 写入;需要删除时用 [记忆:删除 内容片段]。不要写入临时性信息,每次只写最重要的。同一事实发生变化时,必须先用 [记忆:删除] 移除旧条目再 [记忆:添加] 新条目,避免同时存在互相矛盾的记忆。)";
 
 /// 思考长度约束:恒定的独立 system 消息(与思考开关无关,缓存前缀稳定)。
 /// ⚠️ 此文本内容改动会破坏缓存前缀,勿随意修改。
@@ -915,15 +915,19 @@ impl ChatCore {
             }
         }
 
-        // 群聊触发时,剥离关键词前缀
-        let user_text = {
+        // 群聊触发时,剥离关键词前缀;剥完为空(只 @ 没说话/只发触发词)时
+        // 注入占位提问走正常对话,而不是静默丢弃(修复「@ 了却不回复」)
+        let mut user_text = {
             let cfg = self.cfg.read().await;
             trigger::strip_keyword(text, &cfg.napcat.keyword).to_string()
         };
         if user_text.is_empty() {
-            drop(session);
-            self.drain_queue(key).await;
-            return;
+            user_text = if msg.at_me || msg.reply_me {
+                "(对方 @/引用了你,但没有附带文本内容)".to_string()
+            } else {
+                "(对方发出了触发词,但没有附带文本内容)".to_string()
+            };
+            self.log("debug", &format!("[{key}] 触发但无正文,使用占位提问"));
         }
 
         // 上下文预算管理(按当前记忆方案折叠/截断)
@@ -990,9 +994,19 @@ impl ChatCore {
         let (abort_tx, abort_rx) = watch::channel(false);
         self.aborts.lock().unwrap().insert(key.to_string(), abort_tx);
 
-        let (stream_result, pending_sent) = self
+        let (mut stream_result, pending_sent) = self
             .run_streamed_chat(key, turn, msg, &model, &msgs, reserve, abort_rx, pending_cfg, started)
             .await;
+
+        // 正文为空(思考吃光预算/被截断)时关闭思考重试一次,仍失败才走错误分支
+        if let Err(e) = &stream_result {
+            if crate::llm::is_empty_reply_err(e) {
+                self.log("warn", &format!("[{key}] {e},关闭思考重试一次"));
+                let mut m2 = model.clone();
+                m2.thinking = "disabled".into();
+                stream_result = self.llm.chat(&m2, &msgs, Some(reserve)).await;
+            }
+        }
 
         self.aborts.lock().unwrap().remove(key);
         self.set_status(key, SessionStatus::Idle).await;
@@ -1030,10 +1044,11 @@ impl ChatCore {
                     )
                     .await;
                 }
-                // 记忆标记:总是剥离(防止关闭状态泄漏到群里);仅开启时执行
+                // 记忆标记:总是剥离(防止关闭状态泄漏到群里);仅开启时执行。
+                // 剥离后统一清洗(空行折叠/去零宽字符),发送与落历史用同一份文本
                 let mut out = reply.text;
                 let (clean, ops) = memory::parse_memory_ops(&out);
-                out = clean;
+                out = crate::outbound::sanitize_reply(&clean);
                 let mut mem_changed = false;
                 if mem_cfg.enabled {
                     for op in ops {
@@ -1120,12 +1135,18 @@ impl ChatCore {
         self.drain_queue(key).await;
     }
 
-    /// 忙碌时入队(上限 8 条,超出丢最旧,防无限堆积)
+    /// 忙碌时入队(上限 8 条,超出丢最旧并记日志,防无限堆积)
     fn queue_pending(&self, key: &str, msg: ParsedMsg, turn: String) {
         let mut m = self.pending_msgs.lock().unwrap();
         let q = m.entry(key.to_string()).or_default();
         if q.len() >= 8 {
-            q.pop_front();
+            if let Some((dropped, _)) = q.pop_front() {
+                let preview: String = dropped.text.chars().take(50).collect();
+                self.log(
+                    "warn",
+                    &format!("[{key}] 排队已满(8 条),丢弃最旧消息: {preview}"),
+                );
+            }
         }
         q.push_back((msg, turn));
     }
@@ -1243,7 +1264,7 @@ impl ChatCore {
             }
         }
         self.live.lock().unwrap().remove(key);
-        (Ok(stream.finish()), pending_sent)
+        (stream.finish(), pending_sent)
     }
 
     /// 组装消息流(缓存友好顺序,方案由 placement 决定):
@@ -1296,9 +1317,9 @@ impl ChatCore {
         for h in &session.history {
             msgs.push(ApiMessage {
                 role: h.role.clone(),
-                // user 消息带发送者前缀,模型能分清谁说了什么
-                content: if h.role == "user" && h.sender > 0 {
-                    format!("{}{}", speaker_prefix(h.sender), h.text)
+                // user 消息带时间与说话人前缀,模型能分清谁说的、什么时候说的
+                content: if h.role == "user" {
+                    format!("{}{}", history_prefix(h.ts, h.sender), h.text)
                 } else {
                     h.text.clone()
                 },
@@ -1346,14 +1367,20 @@ impl ChatCore {
                 }
             }
         }
+        // 当前提问:同样带时间与说话人前缀(与历史一致,模型好对齐)
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         msgs.push(ApiMessage {
             role: "user".into(),
-            content: format!("{}{}", speaker_prefix(msg.user_id), user_text),
+            content: format!("{}{}{}", ts_label(now_ts), speaker_prefix(msg.user_id), user_text),
         });
         msgs
     }
 
-    /// 轻量通道:单轮插话(极小上下文、不落盘、不新开会话、失败静默)
+    /// 轻量通道:单轮插话(极小上下文、不落盘、不新开会话、失败静默)。
+    /// 插话是单轮小请求,关闭思考模式(推理链纯属浪费且会吃光小预算)。
     async fn light_reply(&self, msg: &ParsedMsg, user_text: &str, turn: &str) {
         let (prompt, model, max_tokens) = {
             let cfg = self.cfg.read().await;
@@ -1363,9 +1390,10 @@ impl ChatCore {
                 cfg.chat.interject.interject_max_tokens.max(16),
             )
         };
-        let Some(model) = model else {
+        let Some(mut model) = model else {
             return;
         };
+        model.thinking = "disabled".into();
         let key = session_key(msg);
         let msgs = vec![
             ApiMessage {
@@ -1384,13 +1412,14 @@ impl ChatCore {
             Ok(reply) => {
                 self.record_usage(&model, "interject", &reply.usage);
                 self.emit_llm_stats(&model, &reply.usage, started.elapsed().as_millis() as u64).await;
-                // 插话场景剥离记忆标记但不执行(轻量通道不管理记忆)
+                // 插话场景剥离记忆标记但不执行(轻量通道不管理记忆);清洗后为空则静默
+                // (插话没话说就闭嘴,比发占位符自然)
                 let (text, _) = memory::parse_memory_ops(&reply.text);
-                let out = if text.is_empty() {
-                    "(模型未返回内容)".to_string()
-                } else {
-                    text
-                };
+                let out = crate::outbound::sanitize_reply(&text);
+                if out.is_empty() {
+                    self.log("debug", &format!("[{key}] 插话无内容,跳过发送"));
+                    return;
+                }
                 let _ = self.send_text(msg, &out).await;
                 self.trace_push(
                     &key,
@@ -1790,11 +1819,16 @@ impl ChatCore {
     ) {
         let dropped: Vec<HistoryMsg> = session.history.drain(..drop).collect();
         let old_summary = session.summary.clone().unwrap_or_default();
+        // user 消息带说话人前缀传给摘要器:折叠后「谁说的」仍然可辨
         let api_msgs: Vec<ApiMessage> = dropped
             .iter()
             .map(|h| ApiMessage {
                 role: h.role.clone(),
-                content: h.text.clone(),
+                content: if h.role == "user" {
+                    format!("{}{}", speaker_prefix(h.sender), h.text)
+                } else {
+                    h.text.clone()
+                },
             })
             .collect();
         let model = self.cfg.read().await.active_model().cloned();
@@ -1878,18 +1912,16 @@ impl ChatCore {
         Ok(())
     }
 
-    /// 发送回复(自动分段)
+    /// 发送回复:清洗后的文本 → CQ 转义(防注入)→ 段落边界分段(超长单段才硬切)
     async fn send_text(&self, msg: &ParsedMsg, text: &str) -> Result<(), String> {
         let (max_len, delay) = {
             let cfg = self.cfg.read().await;
-            (cfg.napcat.max_msg_len.max(1), cfg.napcat.segment_delay_ms)
+            (cfg.napcat.max_msg_len.max(1) as usize, cfg.napcat.segment_delay_ms)
         };
-        let chunks: Vec<String> = text
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(max_len)
-            .map(|c| c.iter().collect())
-            .collect();
+        let chunks = crate::outbound::segment_text(text, max_len);
+        if chunks.is_empty() {
+            return Ok(()); // 清洗后为空的极端情况:不发空消息
+        }
         if chunks.len() > 1 {
             self.log(
                 "info",
@@ -1897,13 +1929,14 @@ impl ChatCore {
             );
         }
         for (i, chunk) in chunks.iter().enumerate() {
+            let escaped = crate::outbound::cq_escape(chunk);
             let r = match msg.kind {
                 MsgKind::Group => {
                     self.sender
-                        .send_group_msg(msg.group_id.unwrap_or(0), chunk)
+                        .send_group_msg(msg.group_id.unwrap_or(0), &escaped)
                         .await
                 }
-                MsgKind::Private => self.sender.send_private_msg(msg.user_id, chunk).await,
+                MsgKind::Private => self.sender.send_private_msg(msg.user_id, &escaped).await,
             };
             if let Err(e) = r {
                 self.log(
@@ -2316,7 +2349,7 @@ pub fn render_trail(
             .unwrap_or(false)
         {
             let hhmm = chrono::DateTime::<chrono::Local>::from(*t)
-                .format("%H:%M")
+                .format("%m-%d %H:%M")
                 .to_string();
             rendered.push(format!("[{hhmm}]{}{text}", speaker_prefix(*sender)));
         }
@@ -2398,6 +2431,22 @@ fn speaker_prefix(sender: i64) -> String {
     } else {
         String::new()
     }
+}
+
+/// 历史消息注入前缀:时间(何时说的)+ 说话人(谁说的);ts ≤ 0(旧记录)时省略时间
+fn history_prefix(ts: i64, sender: i64) -> String {
+    format!("{}{}", ts_label(ts), speaker_prefix(sender))
+}
+
+/// epoch 秒 → "[MM-DD HH:MM] "(本地时区);非法时间返回空串
+fn ts_label(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|d| {
+            chrono::DateTime::<chrono::Local>::from(d)
+                .format("[%m-%d %H:%M] ")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// 忽略前缀命中判断(入口拦截):剥掉开头的引用占位符(如 [引用回复] / [引用QQ123])后,

@@ -17,6 +17,14 @@ use crate::config::ModelConfig;
 /// 用户主动停止的固定错误文案(chat.rs 据此决定不向 QQ 发送错误)
 pub const USER_STOPPED: &str = "用户已停止本次回复";
 
+/// 流式回复正文为空的错误前缀(chat.rs 据此触发「关闭思考重试一次」)
+pub const EMPTY_REPLY: &str = "模型未返回正文";
+
+/// 判断错误是否为「正文为空」(可安全用关闭思考重试)
+pub fn is_empty_reply_err(e: &str) -> bool {
+    e.starts_with(EMPTY_REPLY)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ApiMessage {
     pub role: String,
@@ -98,7 +106,14 @@ impl LlmClient {
             }
         }
         if let Some(t) = max_tokens {
-            body["max_tokens"] = json!(t.min(m.max_tokens));
+            // 思考模式下 reasoning 与正文共享 max_tokens:小预算会被思考吃光,
+            // 正文为空(即「(模型未返回内容)」的根因)。因此思考开启时直接用模型上限,
+            // 关闭思考时才按调用方给的预算收紧。
+            if is_deepseek && m.thinking != "disabled" {
+                body["max_tokens"] = json!(m.max_tokens);
+            } else {
+                body["max_tokens"] = json!(t.min(m.max_tokens));
+            }
         }
         body
     }
@@ -108,8 +123,14 @@ impl LlmClient {
         let msg = &choice["message"];
         let text = msg["content"].as_str().unwrap_or("").trim().to_string();
         let reasoning = msg["reasoning_content"].as_str().unwrap_or("").trim().to_string();
-        if text.is_empty() && reasoning.is_empty() {
-            return Err(format!("模型返回空内容: {}", truncate(raw, 300)));
+        if text.is_empty() {
+            // 正文为空即为错误:与流式路径一致,由上层决定重试
+            let reason = choice["finish_reason"].as_str().unwrap_or("");
+            return Err(format!(
+                "{EMPTY_REPLY}: {}(原始响应: {})",
+                if !reason.is_empty() { reason } else { "响应无正文" },
+                truncate(raw, 300)
+            ));
         }
         let usage = Usage {
             prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
@@ -202,6 +223,7 @@ impl LlmClient {
             reasoning: String::new(),
             usage: Usage::default(),
             pending_content: None,
+            finish_reason: String::new(),
         })
     }
 
@@ -257,7 +279,7 @@ impl LlmClient {
         dropped: &[ApiMessage],
         max_tokens: u32,
     ) -> Result<(String, Usage), String> {
-        let mut content = String::from("请把下面的对话历史压缩成简洁的要点摘要,保留:关键事实、用户的偏好与要求、尚未完成的事项、对话主题。\n每条要点必须注明是谁说的:用户说的标「用户:」,AI 说的标「AI:」。\n只输出摘要本身。\n\n");
+        let mut content = String::from("请把下面的对话历史压缩成简洁的要点摘要,保留:关键事实、用户的偏好与要求、尚未完成的事项、对话主题、以及已做出的选择和决定(如游戏里选定的物品、约定的规则等,必须写明具体内容,不得改写或省略)。\n每条要点必须注明是谁说的:用户说的标「用户:」,AI 说的标「AI:」。\n只输出摘要本身。\n\n");
         if !old_summary.is_empty() {
             content.push_str("【已有摘要】\n");
             content.push_str(old_summary);
@@ -283,9 +305,9 @@ impl LlmClient {
     }
 
     /// 决策请求:判断这条消息是否需要回复。
-    /// 思考模式与推理强度跟随模型配置(先思考,再输出字母);仅输出上限 32 tokens。
-    /// 上下文只带人设 + 当前消息(附触发说明),不带历史(决策只看当下值不值得回)。
-    /// 返回(结论, usage)。
+    /// 关闭思考模式(Y/N 单字母判断不需要推理链,思考只会吃光小预算导致空回复)、
+    /// 仅输出上限 64 tokens。上下文只带人设 + 当前消息(附触发说明),不带历史
+    /// (决策只看当下值不值得回)。返回(结论, usage)。
     pub async fn decide(
         &self,
         m: &ModelConfig,
@@ -295,9 +317,10 @@ impl LlmClient {
         sender: i64,
     ) -> Result<(bool, Usage), String> {
         let mut m2 = m.clone();
-        m2.max_tokens = 32;
+        m2.thinking = "disabled".into();
+        m2.max_tokens = 64;
         let msgs = build_decide_messages(prompt, text, trigger_hint, sender);
-        let reply = self.chat(&m2, &msgs, Some(32)).await?;
+        let reply = self.chat(&m2, &msgs, Some(64)).await?;
         Ok((parse_decision(&reply.text), reply.usage))
     }
 }
@@ -322,6 +345,8 @@ pub struct StreamedChat {
     usage: Usage,
     /// 同一 delta 中 reasoning 与 content 并存时暂存的正文增量
     pending_content: Option<String>,
+    /// 最终块的结束原因(stop=正常结束;length=被 max_tokens 截断)
+    finish_reason: String,
 }
 
 impl StreamedChat {
@@ -367,6 +392,9 @@ impl StreamedChat {
     /// 应用一个 data 块:累积增量与 usage,返回增量事件(如有)
     fn apply_chunk(&mut self, v: &Value) -> Option<StreamEvent> {
         let delta = &v["choices"][0]["delta"];
+        if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+            self.finish_reason = fr.to_string();
+        }
         if let Some(usage) = v["usage"].as_object() {
             self.usage = Usage {
                 prompt_tokens: usage
@@ -417,13 +445,33 @@ impl StreamedChat {
         None
     }
 
-    /// 取最终结果(应在 next_event 返回 None 后调用)
-    pub fn finish(self) -> LlmReply {
-        LlmReply {
-            text: self.text.trim().to_string(),
-            reasoning: self.reasoning.trim().to_string(),
-            usage: self.usage,
+    /// 取最终结果(应在 next_event 返回 None 后调用)。
+    /// 正文为空视为错误:思考吃光预算 / 截断 / 服务端异常都走这里,
+    /// 由上层决定重试(而非发「(模型未返回内容)」占位符)。
+    pub fn finish(self) -> Result<LlmReply, String> {
+        let text = self.text.trim().to_string();
+        let reasoning = self.reasoning.trim().to_string();
+        if text.is_empty() {
+            let reason = if self.finish_reason == "length" {
+                "输出被 max_tokens 截断"
+            } else if !self.finish_reason.is_empty() {
+                &self.finish_reason
+            } else {
+                "无结束原因"
+            };
+            if reasoning.is_empty() {
+                return Err(format!("{EMPTY_REPLY}: {reason}"));
+            }
+            return Err(format!(
+                "{EMPTY_REPLY}: 思考了 {} 字后未输出正文({reason})",
+                reasoning.chars().count()
+            ));
         }
+        Ok(LlmReply {
+            text,
+            reasoning,
+            usage: self.usage,
+        })
     }
 }
 
@@ -514,7 +562,8 @@ mod tests {
             Some(1024),
             false,
         );
-        assert_eq!(body["max_tokens"], 1024);
+        // 默认模型(DeepSeek)思考开启:小预算不生效,直接用模型上限(防思考吃光预算)
+        assert_eq!(body["max_tokens"], 8192);
         // 请求值超过模型上限时封顶到模型上限
         let body2 = LlmClient::build_body(
             &m,
@@ -540,6 +589,7 @@ mod tests {
             reasoning: String::new(),
             usage: Usage::default(),
             pending_content: None,
+            finish_reason: String::new(),
         };
         let v = serde_json::json!({
             "choices": [{"delta": {"reasoning_content": "想", "content": ""}}]
@@ -571,6 +621,74 @@ mod tests {
             _ => panic!("应为思考增量"),
         }
         assert_eq!(sc.pending_content.as_deref(), Some("接着写"));
+    }
+
+    #[test]
+    fn finish_empty_text_is_error() {
+        // 正文为空(思考吃光预算)必须报错,且错误可被识别用于重试
+        let (_tx, rx) = watch::channel(false);
+        let sc = StreamedChat {
+            stream: Box::pin(futures_util::stream::empty()),
+            buffer: String::new(),
+            cancel: rx,
+            text: "   ".into(),
+            reasoning: "想了很多".into(),
+            usage: Usage::default(),
+            pending_content: None,
+            finish_reason: "length".into(),
+        };
+        let err = sc.finish().unwrap_err();
+        assert!(is_empty_reply_err(&err));
+        assert!(err.contains("思考"));
+        // 正常结束:Ok
+        let (_tx, rx) = watch::channel(false);
+        let sc = StreamedChat {
+            stream: Box::pin(futures_util::stream::empty()),
+            buffer: String::new(),
+            cancel: rx,
+            text: "  你好 ".into(),
+            reasoning: String::new(),
+            usage: Usage::default(),
+            pending_content: None,
+            finish_reason: "stop".into(),
+        };
+        assert_eq!(sc.finish().unwrap().text, "你好");
+    }
+
+    #[test]
+    fn thinking_mode_uses_model_cap() {
+        // 思考模式:小预算不卡死(用模型上限,防思考吃光预算正文为空)
+        let mut m = ModelConfig::default();
+        m.model = "deepseek-v4".into();
+        m.max_tokens = 8192;
+        let body = LlmClient::build_body(
+            &m,
+            &[ApiMessage { role: "user".into(), content: "hi".into() }],
+            Some(1024),
+            true,
+        );
+        assert_eq!(body["max_tokens"], 8192);
+        // 关闭思考:按调用方预算收紧
+        let mut m2 = m.clone();
+        m2.thinking = "disabled".into();
+        let body2 = LlmClient::build_body(
+            &m2,
+            &[ApiMessage { role: "user".into(), content: "hi".into() }],
+            Some(1024),
+            true,
+        );
+        assert_eq!(body2["max_tokens"], 1024);
+        // 非 DeepSeek:维持 min 语义
+        let mut m3 = ModelConfig::default();
+        m3.model = "qwen-max".into();
+        m3.max_tokens = 8192;
+        let body3 = LlmClient::build_body(
+            &m3,
+            &[ApiMessage { role: "user".into(), content: "hi".into() }],
+            Some(1024),
+            true,
+        );
+        assert_eq!(body3["max_tokens"], 1024);
     }
 }
 

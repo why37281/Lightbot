@@ -5,6 +5,7 @@ mod cost;
 mod llm;
 mod memory;
 mod napcat;
+mod outbound;
 mod placement;
 mod trace;
 mod trigger;

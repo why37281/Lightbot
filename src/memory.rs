@@ -173,10 +173,14 @@ impl MemoryStore {
     }
 }
 
-/// 时间显示 MM-DD
+/// 时间显示 MM-DD HH:MM(注入上下文与 GUI 共用;带时刻便于模型分辨先后)
 pub fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| d.format("%m-%d").to_string())
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 

@@ -614,7 +614,16 @@ impl NapcatClient {
             let cfg = self.cfg.read().await;
             (cfg.napcat.reverse_port, cfg.napcat.access_token.clone())
         };
-        let addr: SocketAddr = format!("0.0.0.0:{port}").parse().expect("端口配置无效");
+        // 端口配置非法时上报错误并退出监听任务(而非 panic 拖垮整个运行时)
+        let Ok(addr): Result<SocketAddr, _> = format!("0.0.0.0:{port}").parse() else {
+            self.update_status(
+                false,
+                &format!("0.0.0.0:{port}"),
+                None,
+                &format!("反向 WS 端口配置无效: {port}(请检查设置)"),
+            );
+            return;
+        };
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
