@@ -16,6 +16,7 @@ mod runtime;
 mod session;
 mod trace;
 mod trigger;
+mod watchdog;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

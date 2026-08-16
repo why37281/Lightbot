@@ -250,6 +250,19 @@ function handleEvent(ev) {
     case "trace":
       if (detailState.key && ev.key === detailState.key) tickState.dirtyDetail = true;
       break;
+    case "alarm": {
+      // 连接告警(QQ 离线/心跳丢失):顶部横幅 + 日志;raised=false 为恢复
+      const banner = $("#alarm-banner");
+      if (ev.raised) {
+        $("#alarm-text").textContent = "⚠️ " + ev.text;
+        banner.classList.remove("hidden");
+        addLog("warn", "🔌 " + ev.text);
+      } else {
+        banner.classList.add("hidden");
+        addLog("info", "🔌 " + ev.text);
+      }
+      break;
+    }
     case "placement_proposal": showApprovalModal(ev.proposal); break;
   }
 }

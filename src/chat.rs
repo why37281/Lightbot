@@ -43,6 +43,7 @@ use crate::trace::{self, TraceEvent, TraceStore};
 use crate::context::speaker_prefix;
 use crate::trigger;
 use crate::trigger::ignore_prefix_hit;
+use crate::watchdog::{AlarmChange, ConnectionWatchdog};
 
 // ---------- 业务核心 ----------
 
@@ -70,6 +71,8 @@ pub struct ChatCore {
     pub mem_changes: AtomicU64,
     /// 轨迹目录
     pub trace_dir: PathBuf,
+    /// 连接看门狗(QQ 离线 / 心跳丢失检测)
+    watchdog: StdMutex<ConnectionWatchdog>,
 }
 
 impl ChatCore {
@@ -100,6 +103,40 @@ impl ChatCore {
             paused,
             decide_cancel,
             mem_changes: AtomicU64::new(0),
+            watchdog: StdMutex::new(ConnectionWatchdog::default()),
+        }
+    }
+
+    // ---------- 连接看门狗 ----------
+
+    /// 心跳到达(事件管线转发);状态变化时发告警/恢复事件
+    pub fn handle_heartbeat(&self, online: bool, good: bool, interval_ms: u64) {
+        let changes = self
+            .watchdog
+            .lock()
+            .unwrap()
+            .on_heartbeat(online, good, interval_ms);
+        self.emit_alarm_changes(changes);
+    }
+
+    /// WS 连接状态变化(命令层状态转发任务调用)
+    pub fn handle_conn_status(&self, connected: bool) {
+        self.watchdog.lock().unwrap().on_status(connected);
+    }
+
+    /// 周期检查心跳丢失(cleaner_loop 每 60s 调用)
+    fn check_watchdog(&self) {
+        let changes = self.watchdog.lock().unwrap().check();
+        self.emit_alarm_changes(changes);
+    }
+
+    fn emit_alarm_changes(&self, changes: Vec<AlarmChange>) {
+        for c in changes {
+            self.log(if c.raised { "warn" } else { "info" }, &format!("🔌 {c}"));
+            self.events.lock().unwrap().push(FrontendEvent::Alarm {
+                text: c.text,
+                raised: c.raised,
+            });
         }
     }
 
@@ -1125,6 +1162,8 @@ impl ChatCore {
             tokio::select! {
                 _ = stop.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    // 连接看门狗:心跳丢失检测(QQ 离线由心跳状态即时上报)
+                    self.check_watchdog();
                     // 运行时状态统一清理(过期轨迹/空活跃窗口/状态归位/残留直播与排队)
                     self.rt.cleanup();
                     let hours = self.cfg.read().await.chat.clean_after_hours;

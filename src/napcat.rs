@@ -36,8 +36,8 @@ pub enum BotEvent {
     Notice(NoticeInfo),
     /// 请求(加好友/加群)
     Request(RequestInfo),
-    /// 心跳
-    Heartbeat,
+    /// 心跳(OneBot meta_event,带 NapCat 的连接状态:QQ 是否在线等)
+    Heartbeat { online: bool, good: bool, interval_ms: u64 },
     /// 其他生命周期事件(未知类型原样描述)
     Lifecycle(String),
 }
@@ -201,7 +201,12 @@ fn parse_incoming(text: &str, self_id: Option<i64>) -> Option<BotEvent> {
         "meta_event" => {
             let st = v["meta_event_type"].as_str().unwrap_or("");
             if st == "heartbeat" {
-                Some(BotEvent::Heartbeat)
+                // NapCat 心跳带 status:{online,good}(QQ 登录态)与 interval(心跳间隔 ms)
+                Some(BotEvent::Heartbeat {
+                    online: v["status"]["online"].as_bool().unwrap_or(true),
+                    good: v["status"]["good"].as_bool().unwrap_or(true),
+                    interval_ms: v["interval"].as_u64().unwrap_or(0),
+                })
             } else {
                 Some(BotEvent::Lifecycle(st.to_string()))
             }

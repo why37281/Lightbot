@@ -44,6 +44,8 @@ pub enum FrontendEvent {
     SessionStatus { key: String, status: String },
     /// 完整轨迹事件(会话详情页时间线 + 落盘)
     Trace { key: String, entry: TraceEvent },
+    /// 连接告警(QQ 离线 / 心跳丢失;raised=false 为恢复)——GUI 顶部横幅 + 日志
+    Alarm { text: String, raised: bool },
     /// 记忆位置切换提案(醒目弹窗审批)
     PlacementProposal { proposal: placement::Proposal },
 }

@@ -265,7 +265,10 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
                         notice_type: format!("request_{}", r.request_type),
                     });
                 }
-                BotEvent::Heartbeat => {}
+                BotEvent::Heartbeat { online, good, interval_ms } => {
+                    // 心跳喂给连接看门狗(QQ 离线/心跳丢失检测)
+                    chat2.handle_heartbeat(online, good, interval_ms);
+                }
                 BotEvent::Lifecycle(l) => {
                     events2.lock().unwrap().push(FrontendEvent::Log {
                         level: "info".into(),
@@ -276,12 +279,14 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
         }
     }));
 
-    // 连接状态 -> 事件缓冲(同时写快照供 get_status_view 兜底)
+    // 连接状态 -> 事件缓冲(同时写快照供 get_status_view 兜底)+ 看门狗
     let events3 = state.events.clone();
     let last_status = state.last_status.clone();
+    let chat4 = chat.clone();
     tasks.push(tauri::async_runtime::spawn(async move {
         while status_rx.changed().await.is_ok() {
             let s = status_rx.borrow().clone();
+            chat4.handle_conn_status(s.connected);
             *last_status.lock().unwrap() = Some(s.clone());
             events3.lock().unwrap().push(FrontendEvent::Status { status: s.clone() });
             events3.lock().unwrap().push(FrontendEvent::Log {

@@ -148,8 +148,7 @@ h3 { font-size: 14px; margin: 18px 0 10px; color: var(--muted); }
 }
 
 /* 保存结果浮层提示 */
-#save-toast {
-  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+#save-toast {  position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
   z-index: 200; padding: 10px 22px; border-radius: 10px; font-size: 13px;
   background: var(--bg2); border: 1px solid var(--ok); color: var(--text);
   box-shadow: 0 10px 30px rgba(0,0,0,.35);
@@ -416,3 +415,14 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 }
 .approval-nums b { color: var(--text); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+
+/* ============ 连接告警横幅(QQ 离线 / 心跳丢失) ============ */
+#alarm-banner {
+  position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
+  z-index: 150; max-width: min(720px, 92vw);
+  padding: 9px 18px; border-radius: 10px; font-size: 13px;
+  background: var(--bg2); border: 1px solid var(--err); color: var(--err);
+  box-shadow: 0 8px 28px rgba(0,0,0,.4);
+  animation: popin .18s ease; text-align: center;
+}
+#alarm-banner.hidden { display: none; }
