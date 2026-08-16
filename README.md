@@ -1,5 +1,7 @@
 # 💡 LightBot — 轻量级 NapCat QQ AI 机器人框架
 
+> 当前版本 **v1.0.0**(首个正式版)。
+
 基于 **NapCat(OneBot 11)+ AI 大模型(DeepSeek 等)** 的 QQ 机器人框架,主打:
 
 - **极致轻量**:Tauri v2 + Rust 后端 + 原生 Web 前端,单个可执行文件(几 MB),内存占用远低于 Electron 方案;

@@ -247,8 +247,9 @@ impl ChatCore {
         // 会话级暂停(/pause 设置):仅本会话只接收,不决策、不回复、不思考。
         // 只放行 /pause 与 /resume 本身——否则暂停后无法恢复,且未知斜杠命令
         // 会借道命令通道触发 LLM 对话,破坏「仅接收」语义。
+        // (剥掉引用占位符再判断:引用回复机器人发出的 /resume 同样有效)
         {
-            let t = msg.text.trim();
+            let t = trigger::strip_quote_prefix(msg.text.trim());
             let pause_ctrl = t == "/pause" || t == "/resume";
             if self.rt.is_session_paused(&key) && !pause_ctrl {
                 self.log(
@@ -276,8 +277,9 @@ impl ChatCore {
         let win_min = cfg.chat.interject.activity_window_minutes.max(1);
         self.rt.track_activity(&key, win_min * 60);
 
-        // 斜杠命令:群聊/私聊均可直接触发,跳过决策器(命令绝不因决策器被吞)
-        let is_cmd = msg.text.trim_start().starts_with('/');
+        // 斜杠命令:群聊/私聊均可直接触发,跳过决策器(命令绝不因决策器被吞)。
+        // 引用回复机器人的消息剥掉占位符后同样识别为命令。
+        let is_cmd = trigger::strip_quote_prefix(msg.text.trim_start()).starts_with('/');
         if is_cmd {
             self.full_dialogue(&key, &msg, &turn).await;
             return;
@@ -530,8 +532,9 @@ impl ChatCore {
             &format!("[{key}] 会话加载: 历史 {} 条", session.history.len()),
         );
 
-        // 命令处理(先于一切模型调用;返回 Some(回复) 表示已处理)
-        let text = msg.text.trim();
+        // 命令处理(先于一切模型调用;返回 Some(回复) 表示已处理)。
+        // 剥掉引用占位符:引用回复机器人的消息带命令同样执行。
+        let text = trigger::strip_quote_prefix(msg.text.trim());
         if text.starts_with('/') {
             if let Some(reply) = self.handle_command(&mut session, msg, text).await {
                 self.trace_push(

@@ -55,7 +55,7 @@ $("#btn-theme").addEventListener("click", () => {
 function switchTab(name) {
   $$("#sidebar nav a").forEach((x) => x.classList.toggle("active", x.dataset.tab === name));
   $$(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name));
-  if (name === "chat") {
+  if (name === "sessions") {
     refreshSessions();
     renderMemories();
   } else if (name === "overview") {
@@ -68,21 +68,53 @@ $$("#sidebar nav a").forEach((a) => {
 });
 
 // ---------- 2c. 日志 ----------
+// 追加式渲染:新日志只 append 一行(不再全量重建 2000 行),用户向上翻阅时
+// 不被强制拉回底部;筛选切换时才整体重渲染。
+const LOG_RANK = { debug: 0, info: 1, msg_in: 1, msg_out: 1, notice: 1, stats: 1, warn: 2, error: 3 };
+let logNeedsFullRender = false; // 环形淘汰后过滤视图可能失真,置位待全量刷
+
+function logPasses(l) {
+  const lv = $("#log-level").value;
+  if (lv === "all") return true;
+  // 「信息+」「警告+」按级别.rank >= 所选级别;「错误」为精确匹配
+  const rank = LOG_RANK[l.level] ?? 1;
+  return lv === "error" ? l.level === "error" : rank >= LOG_RANK[lv];
+}
+
+function appendLogLine(l) {
+  if (!logPasses(l)) return;
+  const box = $("#log-box");
+  // 只有本来就贴着底部时才跟随滚动(向上翻阅不打扰)
+  const follow = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  const div = document.createElement("div");
+  div.className = "log-line " + l.level;
+  div.innerHTML = `<span class="t">${l.ts}</span>${escapeHtml(l.msg)}`;
+  box.appendChild(div);
+  if (follow) box.scrollTop = box.scrollHeight;
+}
+
 function addLog(level, msg) {
   const now = new Date();
   const ts = now.toTimeString().slice(0, 8);
   logs.push({ ts, level, msg });
-  if (logs.length > 2000) logs.shift();
-  renderLogs();
+  if (logs.length > 2000) {
+    logs.shift();
+    logNeedsFullRender = true; // 旧行被淘汰,当前过滤视图可能失真
+  }
+  appendLogLine(logs[logs.length - 1]);
+  $("#log-count").textContent = `共 ${logs.length} 条`;
 }
 
 function renderLogs() {
-  const lv = $("#log-level").value;
+  if (logNeedsFullRender) {
+    // 淘汰发生后:内存视图与显示已经一致,直接清除标记
+    logNeedsFullRender = false;
+  }
   const box = $("#log-box");
   box.innerHTML = "";
   let shown = 0;
   for (const l of logs) {
-    if (lv !== "all" && l.level !== lv) continue;
+    if (!logPasses(l)) continue;
     shown++;
     const div = document.createElement("div");
     div.className = "log-line " + l.level;
@@ -213,12 +245,6 @@ function updateStatusView(st) {
   $("#ov-mode").textContent = st.mode === "reverse" ? "反向 WS" : "正向 WS";
   $("#ov-endpoint").textContent = st.endpoint || "-";
   $("#ov-self").textContent = st.self_id ? String(st.self_id) : (cfg?.napcat?.self_id || "自动获取中");
-}
-
-function updatePausedUi() {
-  const btn = $("#btn-detail-stop");
-  if (btn) btn.textContent = paused ? "▶ 恢复" : "■ 停止";
-  updateStatusView({ connected: true, mode: "", endpoint: "", self_id: null, last_error: "", paused });
 }
 
 function renderOverview() {
@@ -393,12 +419,44 @@ function syncInterjectFields() {
 }
 $("#cfg-interject-mode").addEventListener("change", syncInterjectFields);
 
-// ---------- 保存 ----------
+// ---------- 保存(浮层提示 + 未保存改动标记) ----------
+let configDirty = false;
+function markDirty() {
+  if (configDirty) return;
+  configDirty = true;
+  $("#btn-save").classList.add("dirty");
+  $("#btn-save").title = "有未保存的改动";
+}
+function clearDirty() {
+  configDirty = false;
+  $("#btn-save").classList.remove("dirty");
+  $("#btn-save").title = "";
+}
+
+let saveToastTimer = null;
+function showSaveToast(text, ok) {
+  const el = $("#save-toast");
+  el.textContent = text;
+  el.classList.toggle("err", !ok);
+  el.classList.remove("hidden");
+  if (saveToastTimer) clearTimeout(saveToastTimer);
+  saveToastTimer = setTimeout(() => el.classList.add("hidden"), 2600);
+}
+
+// 配置相关页面的任何输入都置脏(模型/人设卡片在渲染时动态生成,事件委托统一捕获)
+document.addEventListener("input", (e) => {
+  if (e.target.closest("#tab-napcat, #tab-models, #tab-chat, #tab-prompts")) markDirty();
+});
+document.addEventListener("change", (e) => {
+  if (e.target.closest("#tab-napcat, #tab-models, #tab-chat, #tab-prompts")) markDirty();
+});
+
 $("#btn-save").addEventListener("click", async () => {
   try {
     collectForm();
     await invoke("save_config", { cfg });
-    setResult(null, "✅ 配置已保存" + (running ? "并已应用" : "(启动后生效)"));
+    clearDirty();
+    showSaveToast(running ? "✅ 配置已保存并已应用" : "✅ 配置已保存(启动后生效)", true);
     addLog("info", "配置已保存");
     renderModels();
     renderPrompts();
@@ -406,7 +464,7 @@ $("#btn-save").addEventListener("click", async () => {
     refreshCost();
     startTickLoop(); // 刷新间隔可能已变更,按新值重启循环
   } catch (e) {
-    setResult(String(e), "err");
+    showSaveToast("❌ 保存失败: " + e, false);
     addLog("error", "保存配置失败: " + e);
   }
 });
@@ -429,6 +487,7 @@ $("#btn-toggle").addEventListener("click", async () => {
       collectForm();
       // 未保存的修改先保存
       await invoke("save_config", { cfg });
+      clearDirty();
       await invoke("start_bot");
       addLog("info", "机器人已启动");
     }
@@ -1104,6 +1163,7 @@ $("#btn-detail-back").addEventListener("click", () => {
   detailState.turnBlocks.clear();
 });
 
+// 全局暂停(所有会话只接收,不决策不回复;与 QQ 里逐会话的 /pause 相互独立)
 $("#btn-detail-stop").addEventListener("click", async () => {
   try {
     const next = !paused;
@@ -1112,6 +1172,24 @@ $("#btn-detail-stop").addEventListener("click", async () => {
     updatePausedUi();
     addLog("info", next ? "已停止所有回复/决策/思考,仅接收消息" : "已恢复回复");
   } catch (e) { alert("操作失败: " + e); }
+});
+
+function updatePausedUi() {
+  const btn = $("#btn-detail-stop");
+  if (btn) {
+    btn.textContent = paused ? "▶ 恢复回复(全局)" : "⏸ 全局暂停";
+    btn.classList.toggle("danger", paused);
+  }
+  updateStatusView({ connected: true, mode: "", endpoint: "", self_id: null, last_error: "", paused });
+}
+
+// 停止本回合:中止该会话进行中的流式模型请求(不发全局暂停)
+$("#btn-detail-stop-turn").addEventListener("click", async () => {
+  if (!detailState.key) return;
+  try {
+    const stopped = await invoke("stop_session", { key: detailState.key });
+    addLog(stopped ? "info" : "warn", stopped ? "已发送停止指令,本回合即将中止" : "该会话当前没有进行中的回复");
+  } catch (e) { addLog("error", "停止失败: " + e); }
 });
 
 // 直播:完整轨迹事件 → handleEvent 置 dirtyDetail,由 tick 统一增量渲染。

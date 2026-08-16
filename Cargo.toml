@@ -1,6 +1,6 @@
 [package]
 name = "lightbot"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "LightBot - 轻量级 NapCat QQ 机器人框架,接入 AI 大模型"
 authors = ["LightBot"]

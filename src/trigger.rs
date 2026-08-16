@@ -293,6 +293,29 @@ mod tests {
         cfg.chat.ignore_prefix_enabled = false;
         assert!(!ignore_prefix_hit(&cfg, "*你好"));
     }
+
+    #[test]
+    fn quote_prefix_stripping() {
+        // 引用回复带命令:占位符剥掉后命令可被识别
+        assert_eq!(strip_quote_prefix("[引用回复] /stats"), "/stats");
+        assert_eq!(strip_quote_prefix("[引用QQ999]  /resume"), "/resume");
+        assert_eq!(strip_quote_prefix("  /pause"), "/pause");
+        // 普通文本与未闭合占位符不受影响
+        assert_eq!(strip_quote_prefix("你好"), "你好");
+        assert_eq!(strip_quote_prefix("[引用回复]"), "[引用回复]");
+    }
+}
+
+/// 剥掉开头的引用占位符(如 `[引用回复] ` / `[引用QQ123] `)。
+/// 引用回复机器人的消息若带命令(`/stats` 等),剥掉占位符后同样能被识别执行。
+pub fn strip_quote_prefix(text: &str) -> &str {
+    let t = text.trim_start();
+    if t.starts_with("[引用") {
+        if let Some(i) = t.find("] ") {
+            return t[i + 2..].trim_start();
+        }
+    }
+    t
 }
 
 /// 忽略前缀命中判断(入口拦截):剥掉开头的引用占位符(如 [引用回复] / [引用QQ123])后,
@@ -301,12 +324,7 @@ pub fn ignore_prefix_hit(cfg: &Config, text: &str) -> bool {
     if !cfg.chat.ignore_prefix_enabled {
         return false;
     }
-    let mut t = text.trim_start();
-    if t.starts_with("[引用") {
-        if let Some(i) = t.find("] ") {
-            t = t[i + 2..].trim_start();
-        }
-    }
+    let t = strip_quote_prefix(text);
     cfg.chat
         .ignore_prefix
         .split(',')

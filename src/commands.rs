@@ -556,7 +556,7 @@ pub async fn add_memory(
     let added = store.add(&text, "user", mc.max_entries as usize, mc.max_entry_chars as usize);
     if added {
         // 通知运行中的核心:记忆变更(自动控制评估用)
-        if let Some(c) = state.chat.lock().unwrap().clone() {
+        if let Some(c) = state.chat.lock().map_err(|e| e.to_string())?.clone() {
             c.mark_memory_changed();
         }
         Ok(())
@@ -578,7 +578,7 @@ pub async fn delete_memory(
     let mut store = MemoryStore::new(path);
     store.refresh();
     if store.remove_index(index) {
-        if let Some(c) = state.chat.lock().unwrap().clone() {
+        if let Some(c) = state.chat.lock().map_err(|e| e.to_string())?.clone() {
             c.mark_memory_changed();
         }
         Ok(())
