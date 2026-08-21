@@ -6,6 +6,7 @@
 use serde::Serialize;
 use std::collections::VecDeque;
 
+use crate::agent::AgentTask;
 use crate::napcat::ConnStatus;
 use crate::placement;
 use crate::trace::TraceEvent;
@@ -48,6 +49,10 @@ pub enum FrontendEvent {
     Alarm { text: String, raised: bool },
     /// 记忆位置切换提案(醒目弹窗审批)
     PlacementProposal { proposal: placement::Proposal },
+    /// SubAgent 任务状态更新(全量任务视图;GUI 渲染任务卡片)
+    AgentTaskUpdated { task: AgentTask },
+    /// SubAgent 任务日志(展示在任务卡片内)
+    AgentLog { task_id: String, msg: String },
 }
 
 /// 事件环形缓冲(拉模式):前端通过 get_events 轮询拉取。

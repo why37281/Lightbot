@@ -1,3 +1,4 @@
+mod agent;
 mod botcmd;
 mod chat;
 mod context;
@@ -13,6 +14,7 @@ mod napcat;
 mod outbound;
 mod placement;
 mod runtime;
+mod sandbox;
 mod session;
 mod trace;
 mod trigger;
@@ -51,6 +53,14 @@ pub fn run() {
             commands::query_balance,
             commands::get_placement_proposal,
             commands::approve_placement,
+            commands::get_agent_tasks,
+            commands::spawn_agent_task,
+            commands::approve_agent_step,
+            commands::reject_agent_step,
+            commands::pause_agent,
+            commands::resume_agent,
+            commands::stop_agent,
+            commands::remove_agent_task,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -121,6 +131,7 @@ mod tests {
             placement,
             paused,
             decide_cancel,
+            None,
         ));
 
         // 事件管线

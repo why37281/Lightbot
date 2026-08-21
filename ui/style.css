@@ -426,3 +426,50 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
   animation: popin .18s ease; text-align: center;
 }
 #alarm-banner.hidden { display: none; }
+
+/* ============ SubAgent 面板 ============ */
+.st-run      { --c: #34d399; --bgc: rgba(52,211,153,.15); }
+.st-paused   { --c: #fbbf24; --bgc: rgba(251,191,36,.15); }
+.st-done     { --c: #4da3ff; --bgc: rgba(77,163,255,.15); }
+.st-fail     { --c: #f87171; --bgc: rgba(248,113,113,.15); }
+.st-stop     { --c: #8b98a5; --bgc: rgba(139,152,165,.15); }
+
+.agent-create { display: flex; gap: 8px; align-items: center; }
+.agent-create select, .agent-create input { padding: 7px 10px; }
+
+.agent-tasks { display: flex; flex-direction: column; gap: 12px; }
+.agent-empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+.agent-card {
+  border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg2); padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.agent-card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px; }
+.agent-mode { font-size: 12px; color: var(--accent); }
+.agent-goal { font-size: 13.5px; line-height: 1.6; }
+.agent-tools code, .agent-pending-tool code { font-size: 12px; }
+.agent-sb { font-size: 12px; color: var(--muted); }
+.agent-card-actions { display: flex; gap: 8px; margin-top: 2px; }
+.agent-summary { font-size: 12.5px; color: var(--text); background: var(--bg3); border-radius: 8px; padding: 8px 10px; }
+.agent-error { font-size: 12.5px; color: var(--err); background: rgba(248,113,113,.08); border-radius: 8px; padding: 8px 10px; }
+
+.agent-pending {
+  border: 1px solid var(--warn); border-radius: 10px;
+  background: rgba(251,191,36,.06); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.agent-pending.sensitive { border-color: var(--err); background: rgba(248,113,113,.08); }
+.agent-pending-head { font-size: 13px; font-weight: 600; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.agent-sens { color: var(--err); font-size: 12px; font-weight: 700; }
+.agent-pending-note { color: var(--muted); font-weight: 400; font-size: 12px; }
+.agent-pending-tool { font-size: 12.5px; }
+.agent-pending-params {
+  background: var(--bg3); border-radius: 8px; padding: 8px 10px;
+  font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  max-height: 200px; overflow: auto; user-select: text;
+}
+.agent-pending-actions { display: flex; gap: 8px; }
+
+.agent-steps summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+.agent-step { font-size: 12px; padding: 3px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+.agent-step-bad code { color: var(--err); }

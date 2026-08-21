@@ -227,10 +227,29 @@ impl LlmClient {
         })
     }
 
+    /// 下载 URL 内容(SubAgent 沙箱工具用;超时 60s,上限 100MB)
+    pub async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("请求失败: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+        let bytes = resp.bytes().await.map_err(|e| format!("读取失败: {e}"))?;
+        if bytes.len() > 100 * 1024 * 1024 {
+            return Err("文件超过 100MB 上限".into());
+        }
+        Ok(bytes.to_vec())
+    }
+
     /// 查询账户余额(DeepSeek `GET /user/balance`,Bearer 认证)。
     /// 返回原始 JSON(`is_available` + `balance_infos`);非 DeepSeek 服务商无此接口会报错。
-    pub async fn balance(&self, m: &ModelConfig) -> Result<Value, String> {
-        let url = format!("{}/user/balance", m.base_url.trim_end_matches('/'));
+    pub async fn balance(&self, m: &ModelConfig) -> Result<Value, String> {        let url = format!("{}/user/balance", m.base_url.trim_end_matches('/'));
         let timeout = Duration::from_secs(m.timeout_secs.max(10));
         let resp = self
             .http

@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tokio::sync::{watch, Mutex, RwLock};
 
+use crate::agent::{AgentManager, AgentMode, AgentTask, OriginInfo};
 use crate::config::{Config, ModelConfig};
 use crate::cost::{CostTracker, UsageRecord};
 use crate::events::{EventBuf, FrontendEvent, SessionStatus};
@@ -44,6 +45,15 @@ use crate::context::speaker_prefix;
 use crate::trigger;
 use crate::trigger::ignore_prefix_hit;
 use crate::watchdog::{AlarmChange, ConnectionWatchdog};
+
+/// 子助手任务结果摘要注入主上下文的存活时长(秒;过期后不再注入,避免陈旧信息占预算)
+pub const AGENT_NOTE_TTL_SECS: i64 = 1800;
+
+/// 待注入主上下文的子助手任务结果
+pub struct AgentNote {
+    pub summary: String,
+    pub ts: i64,
+}
 
 // ---------- 业务核心 ----------
 
@@ -73,6 +83,10 @@ pub struct ChatCore {
     pub trace_dir: PathBuf,
     /// 连接看门狗(QQ 离线 / 心跳丢失检测)
     watchdog: StdMutex<ConnectionWatchdog>,
+    /// SubAgent 管理器(QQ 操作 / 沙箱两种模式;命令层创建后注入)
+    pub agent: Option<Arc<AgentManager>>,
+    /// 子助手任务结果摘要(按会话键;尾部注入主上下文,TTL 内有效)
+    pub agent_notes: RwLock<HashMap<String, AgentNote>>,
 }
 
 impl ChatCore {
@@ -86,6 +100,7 @@ impl ChatCore {
         placement: Arc<StdMutex<PlacementController>>,
         paused: Arc<AtomicBool>,
         decide_cancel: watch::Sender<bool>,
+        agent: Option<Arc<AgentManager>>,
     ) -> Self {
         let trace_dir = sessions_dir.join("traces");
         Self {
@@ -104,6 +119,8 @@ impl ChatCore {
             decide_cancel,
             mem_changes: AtomicU64::new(0),
             watchdog: StdMutex::new(ConnectionWatchdog::default()),
+            agent,
+            agent_notes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -751,10 +768,23 @@ impl ChatCore {
                 if mem_changed {
                     self.mark_memory_changed();
                 }
+                // SubAgent 任务标记:[任务:QQ ...] / [任务:沙箱 ...]
+                // 剥离后后台创建任务(审批/执行走 GUI 面板);剥离逻辑与 [记忆:] 同款
+                let (clean2, task_ops) = crate::agent::parse_task_ops(&out);
+                out = crate::outbound::sanitize_reply(&clean2);
+                if !task_ops.is_empty() {
+                    self.spawn_agent_tasks(key, msg, task_ops).await;
+                }
                 // 思考过程(reasoning_content)只用于统计,绝不发送给用户
                 if out.is_empty() {
-                    out = "(模型未返回内容)".into();
+                    // 若回复仅含任务标记(文本为空),不发占位符(任务本身已在后台运行)
+                    if self.agent.is_some() {
+                        out = String::new();
+                    } else {
+                        out = "(模型未返回内容)".into();
+                    }
                 }
+                if !out.is_empty() {
                 let send_result = self.send_text(msg, &out).await;
                 // 落盘助手消息 + 轨迹(发送失败也记录真实输出)
                 let assistant_id = trace::new_id();
@@ -778,6 +808,7 @@ impl ChatCore {
                 // 记忆位置自动评估(每轮喂指标,窗口满时评估)
                 self.feed_placement_round(user_tokens + assistant_tokens);
                 self.evaluate_placement(&session).await;
+                }
             }
             Err(e) => {
                 let stopped = e == USER_STOPPED;
@@ -1146,8 +1177,7 @@ impl ChatCore {
     pub(crate) async fn emit_session(&self, key: &str, session: &Session) {
         self.events.lock().unwrap().push(FrontendEvent::SessionChanged {
             key: key.to_string(),
-            count: session.history.len(),
-            tokens: session.total_tokens(),
+            count: session.history.len(),            tokens: session.total_tokens(),
         });
     }
 
@@ -1244,6 +1274,211 @@ impl ChatCore {
     }
 
 
+
+    // ---------- SubAgent 集成 ----------
+
+    /// 解析主模型输出的 [任务:QQ/沙箱 ...] 标记并后台创建任务。
+    /// 权限/开关校验失败时向来源会话发送拒绝说明;任务完成后由 AgentManager 回调
+    /// `agent_finished`(注入结果摘要 + 可选主动汇报)。
+    async fn spawn_agent_tasks(&self, key: &str, msg: &ParsedMsg, ops: Vec<(AgentMode, String)>) {
+        let Some(agent) = self.agent.clone() else {
+            self.log("warn", &format!("[{key}] 模型输出了任务标记,但 SubAgent 未初始化"));
+            return;
+        };
+        // 先复制来源信息(闭包不能借用 msg 引用)
+        let kind = msg.kind.clone();
+        let group_id = msg.group_id;
+        let user_id = msg.user_id;
+        for (mode, goal) in ops {
+            let origin = OriginInfo {
+                kind: kind.clone(),
+                group_id,
+                user_id,
+                session_key: key.to_string(),
+                requester_role: String::new(),
+            };
+            self.log("info", &format!("[{key}] 收到子助手任务({}): {goal}", mode.label()));
+            let agent2 = agent.clone();
+            let send_kind = kind.clone();
+            let send_group = group_id;
+            let send_user = user_id;
+            tauri::async_runtime::spawn(async move {
+                match agent2.spawn(mode, &goal, origin).await {
+                    Ok(task_id) => {
+                        // 等待结束(上限 6 小时;暂停等待审批时继续等)
+                        if let Some(task) = agent2
+                            .wait_finished(&task_id, Duration::from_secs(6 * 3600))
+                            .await
+                        {
+                            if let Some(cb) = agent2.on_finished.lock().unwrap().as_ref() {
+                                cb(task);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // 触发被拒绝:向来源会话说明(不打扰主对话管线)
+                        let escaped = crate::outbound::cq_escape(&format!("❌ 子助手任务被拒绝: {e}"));
+                        let r = match send_kind {
+                            MsgKind::Group => {
+                                agent2.sender.send_group_msg(send_group.unwrap_or(0), &escaped).await
+                            }
+                            MsgKind::Private => agent2.sender.send_private_msg(send_user, &escaped).await,
+                        };
+                        if let Err(se) = r {
+                            agent2.events.lock().unwrap().push(FrontendEvent::Log {
+                                level: "warn".into(),
+                                msg: format!("[SubAgent] 拒绝提示发送失败: {se}"),
+                            });
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// 子助手任务结束回调(AgentManager 注册):注入结果摘要到主上下文尾部,
+    /// 并按配置触发主模型主动汇报一次。
+    pub(crate) async fn agent_finished(&self, task: &AgentTask) {
+        let key = &task.origin.session_key;
+        let (inject, report) = {
+            let cfg = self.cfg.read().await;
+            (cfg.agent.inject_result, cfg.agent.report_on_complete)
+        };
+        if !inject && !report {
+            return;
+        }
+        if task.status == crate::agent::TaskStatus::Done {
+            if let Some(summary) = &task.summary {
+                self.log("info", &format!("[{key}] 子助手任务完成: {summary}"));
+                if inject {
+                    self.agent_notes.write().await.insert(
+                        key.clone(),
+                        AgentNote {
+                            summary: summary.clone(),
+                            ts: trace::now_ts(),
+                        },
+                    );
+                }
+                if report {
+                    self.agent_report(key, task).await;
+                }
+            }
+        } else {
+            let err = task
+                .error
+                .clone()
+                .unwrap_or_else(|| "任务未完成".to_string());
+            self.log("warn", &format!("[{key}] 子助手任务未完成: {err}"));
+            if inject {
+                self.agent_notes.write().await.insert(
+                    key.clone(),
+                    AgentNote {
+                        summary: format!("任务失败: {err}"),
+                        ts: trace::now_ts(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// 主模型主动汇报:任务完成后,以主模型身份向来源会话说一句话(流式管线复用)。
+    /// 会话忙(正在回复)时跳过本次汇报——摘要仍在上下文中,下轮对话自然接话。
+    async fn agent_report(&self, key: &str, task: &AgentTask) {
+        let Some(summary) = task.summary.clone() else { return };
+        if summary.is_empty() {
+            return;
+        }
+        let sess = self.get_session(key).await;
+        let Ok(mut session) = sess.try_lock() else {
+            self.log("info", &format!("[{key}] 会话正忙,跳过子助手汇报(摘要已注入上下文)"));
+            return;
+        };
+        // 合成触发消息(仅用于路由与轨迹注入,不产生真实用户消息)
+        let synthetic = ParsedMsg {
+            kind: task.origin.kind.clone(),
+            group_id: task.origin.group_id,
+            user_id: task.origin.user_id,
+            is_self: false,
+            text: String::new(),
+            at_me: false,
+            reply_me: false,
+            raw: serde_json::Value::Null,
+        };
+        let (model, prompt, mem_cfg, trail_cfg, ratio, reserve) = {
+            let cfg = self.cfg.read().await;
+            let model = cfg.active_model().cloned();
+            let prompt = cfg.prompt().map(|p| p.prompt.clone()).unwrap_or_default();
+            (
+                model,
+                prompt,
+                cfg.chat.memory.clone(),
+                cfg.chat.trail.clone(),
+                cfg.chat.estimate_ratio,
+                cfg.chat.reserve_tokens,
+            )
+        };
+        let Some(model) = model else {
+            self.log("warn", &format!("[{key}] 无可用模型,跳过子助手汇报"));
+            return;
+        };
+        let user_text = format!(
+            "(系统提示:子助手刚完成了一个任务,请用一两句话向群友汇报结果,不要复述内部过程。任务结果:{summary})"
+        );
+        let msgs = self
+            .build_messages(&session, key, &synthetic, &prompt, &user_text, &mem_cfg, &trail_cfg, ratio)
+            .await;
+        let turn = trace::new_id();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        self.set_status(key, SessionStatus::Replying).await;
+        let (result, _) = self
+            .run_streamed_chat(
+                key,
+                &turn,
+                &synthetic,
+                &model,
+                &msgs,
+                reserve,
+                cancel_rx,
+                (false, String::new(), 0),
+                started,
+            )
+            .await;
+        match result {
+            Ok(reply) => {
+                self.record_usage(&model, "dialogue", &reply.usage);
+                let (clean, _ops) = memory::parse_memory_ops(&reply.text);
+                let out = crate::outbound::sanitize_reply(&clean);
+                if out.is_empty() {
+                    self.set_status(key, SessionStatus::Idle).await;
+                    return;
+                }
+                let send_result = self.send_text(&synthetic, &out).await;
+                let assistant_id = trace::new_id();
+                session.push_id("assistant", &out, ratio, &assistant_id, 0);
+                self.emit_session(key, &session).await;
+                self.trace_push(
+                    key,
+                    &TraceEvent::MsgOut {
+                        id: Some(assistant_id),
+                        turn: turn.to_string(),
+                        ts: trace::now_ts(),
+                        text: out.clone(),
+                        model: model.model.clone(),
+                        usage: reply.usage.clone(),
+                    },
+                )
+                .await;
+                if let Err(e) = send_result {
+                    self.log("warn", &format!("[{key}] 汇报发送失败: {e}"));
+                }
+            }
+            Err(e) => {
+                self.log("warn", &format!("[{key}] 子助手汇报失败: {e}"));
+            }
+        }
+        self.set_status(key, SessionStatus::Idle).await;
+    }
 
 /// 编辑一条历史消息(同时同步轨迹与内存会话)
 pub async fn update_history_msg(&self, key: &str, id: &str, text: &str) -> Result<(), String> {

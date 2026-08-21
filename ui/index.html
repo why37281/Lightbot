@@ -31,6 +31,7 @@
       <a data-tab="napcat">连接设置</a>
       <a data-tab="models">模型设置</a>
       <a data-tab="chat">会话设置</a>
+      <a data-tab="agent">SubAgent</a>
       <a data-tab="prompts">人设管理</a>
       <a data-tab="logs">日志与通知</a>
     </nav>
@@ -426,6 +427,120 @@
           </div>
         </div>
       </details>
+    </section>
+
+    <!-- SubAgent(子助手:QQ 操作 / 沙箱) -->
+    <section id="tab-agent" class="tab">
+      <h2>SubAgent 子助手</h2>
+      <p class="muted" style="margin-bottom:12px;font-size:12.5px">主模型把要干的事用自然语言表达(回复末尾 <code>[任务:QQ ...]</code> / <code>[任务:沙箱 ...]</code> 标记),子助手先选工具再逐轮执行;每一步操作都需你在此面板亲自审批。模式开关改动不影响缓存前缀(状态以尾部说明注入)。</p>
+
+      <details class="settings-section" open>
+        <summary>模式与权限</summary>
+        <div class="section-body">
+          <div class="form-grid narrow">
+            <label class="check">启用 QQ 操作模式(<code>[任务:QQ ...]</code>:精华/备注/打卡/发图等)
+              <input id="cfg-agent-qq" type="checkbox" />
+            </label>
+            <label class="check">启用沙箱模式(<code>[任务:沙箱 ...]</code>:读写文件/执行命令/下载发送文件)
+              <input id="cfg-agent-sandbox" type="checkbox" />
+            </label>
+            <label>沙箱后端
+              <select id="cfg-sandbox-backend">
+                <option value="jail">jail 轻量目录监狱(默认,零依赖)</option>
+                <option value="docker">docker 容器(强隔离,需本机 Docker)</option>
+              </select>
+            </label>
+            <label>允许触发任务的群角色(逗号分隔;空 = 仅白名单)
+              <input id="cfg-agent-roles" type="text" placeholder="owner,admin" />
+            </label>
+            <label>白名单 QQ(逗号分隔;白名单成员视为可信,可触发并可用敏感工具)
+              <input id="cfg-agent-whitelist" type="text" placeholder="可选" />
+            </label>
+            <label class="check">允许私聊触发(仍需白名单或开关)
+              <input id="cfg-agent-private" type="checkbox" />
+            </label>
+            <label class="check">敏感工具(禁言/全体禁言/移出群/撤回)纳入目录(红字警示+仅群主/管理员可用)
+              <input id="cfg-agent-sensitive" type="checkbox" />
+            </label>
+            <label class="check">完成后触发主模型主动汇报一次(摘要同时注入上下文)
+              <input id="cfg-agent-report" type="checkbox" />
+            </label>
+            <label class="check">任务结果摘要注入主模型上下文尾部(供后续接话)
+              <input id="cfg-agent-inject" type="checkbox" />
+            </label>
+          </div>
+        </div>
+      </details>
+
+      <details class="settings-section">
+        <summary>成本与超时预算</summary>
+        <div class="section-body">
+          <div class="form-grid narrow">
+            <label>工具选择阶段输出预算 tokens
+              <input id="cfg-agent-select-tok" type="number" min="64" max="1024" />
+            </label>
+            <label>执行阶段每轮输出预算 tokens
+              <input id="cfg-agent-step-tok" type="number" min="64" max="2048" />
+            </label>
+            <label>完成摘要输出预算 tokens
+              <input id="cfg-agent-summary-tok" type="number" min="32" max="512" />
+            </label>
+            <label>执行轮次上限(防失控烧钱)
+              <input id="cfg-agent-rounds" type="number" min="1" max="50" />
+            </label>
+            <label>单步审批等待超时(秒;超时自动暂停)
+              <input id="cfg-agent-approval-timeout" type="number" min="30" max="7200" />
+            </label>
+            <label>任务总超时(秒;超时自动停止)
+              <input id="cfg-agent-task-timeout" type="number" min="60" max="86400" />
+            </label>
+            <label>命令白名单(逗号分隔;jail 后端)
+              <input id="cfg-sandbox-allowlist" type="text" />
+            </label>
+            <label>单条命令最大秒数(jail/docker 通用)
+              <input id="cfg-sandbox-cmd-timeout" type="number" min="1" max="3600" />
+            </label>
+            <label>内存上限 MB(Windows Job Object;0=不限制)
+              <input id="cfg-sandbox-mem" type="number" min="0" max="32768" />
+            </label>
+            <label>Docker 镜像(沙箱后端选 docker 时生效)
+              <input id="cfg-sandbox-image" type="text" placeholder="python:3.12-alpine" />
+            </label>
+            <label>Docker 内存限制(如 512m)
+              <input id="cfg-sandbox-docker-mem" type="text" placeholder="512m" />
+            </label>
+            <label class="check">任务结束后销毁沙箱目录/容器
+              <input id="cfg-sandbox-destroy" type="checkbox" />
+            </label>
+          </div>
+        </div>
+      </details>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-title">手动创建任务(测试/直接使用)</div>
+        <div class="card-body agent-create">
+          <select id="agent-create-mode">
+            <option value="qq">QQ 操作</option>
+            <option value="sandbox">沙箱</option>
+          </select>
+          <input id="agent-create-goal" type="text" placeholder="自然语言描述目标,如:把群 12345 里 message_id 888 的消息设为精华" style="flex:1" />
+          <button id="btn-agent-create" class="btn accent">创建任务</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-title">任务列表
+          <button id="btn-agent-refresh" class="btn small">刷新</button>
+          <span class="muted" style="font-size:12px">每一步工具操作都需你亲自审批;暂停后主对话可继续,恢复后续跑</span>
+        </div>
+        <div id="agent-task-list" class="agent-tasks"></div>
+      </div>
+
+      <div class="tips">
+        <h3>工作流程说明</h3>
+        <p>① 主模型输出 <code>[任务:QQ/沙箱 目标]</code> → ② 子助手「调度者」先选工具(上下文只含工具名+一行简述,跨任务缓存命中) → ③ 注入所选工具详细用法后逐轮执行(每轮 JSON:工具调用或 done+摘要) → ④ <b>每步工具调用都进入审批队列,你批准后才真正执行</b>;拒绝会让子助手换方案 → ⑤ 完成后返回简短摘要给主模型,由主模型向群友汇报。子助手上下文从不持久化,任务结束即重置到「仅工具目录」初始状态;QQ 操作与沙箱两种模式互不共享上下文。</p>
+        <p>⚠️ 敏感操作(撤回/禁言/全体禁言/移出群)在审批面板<b>红字警示</b>,且仅群主/管理员(或白名单)发起的任务可用。沙箱任务会先「搭建沙箱再激活」再干活;jail 后端=目录+路径锁定+命令白名单+Job Object 资源限制(防模型误操作,不承诺防恶意攻击),docker 后端=容器级隔离。</p>
+      </div>
     </section>
 
     <!-- 人设管理 -->

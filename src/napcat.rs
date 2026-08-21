@@ -61,7 +61,7 @@ pub struct ParsedMsg {
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum MsgKind {
     Group,
     Private,
@@ -238,9 +238,14 @@ pub fn parse_message(v: &Value, self_id: Option<i64>) -> ParsedMsg {
     }
 }
 
+/// 从原始消息事件提取纯文本(供 SubAgent 群历史等展示用;不做 at/引用标记)
+pub fn extract_text_for_display(v: &Value) -> String {
+    let msg = v.get("message").cloned().unwrap_or(Value::Null);
+    extract_text(&msg, None).0
+}
+
 /// 提取纯文本 + at 检测 + 引用检测(兼容 array 与 CQ string 两种格式)
-fn extract_text(msg: &Value, self_id: Option<i64>) -> (String, bool, bool) {
-    let mut text = String::new();
+fn extract_text(msg: &Value, self_id: Option<i64>) -> (String, bool, bool) {    let mut text = String::new();
     let mut at_me = false;
     let mut reply_me = false;
     match msg {

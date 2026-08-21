@@ -26,6 +26,10 @@ pub struct Config {
     pub active_prompt: String,
     /// 费用与钱包配置(价格随 DeepSeek 官方调价更新,由用户在 GUI 填写)
     pub cost: CostConfig,
+    /// SubAgent 子系统配置(QQ 操作 / 沙箱两种模式的开关、预算、权限)
+    pub agent: AgentConfig,
+    /// 沙箱执行环境配置(jail 目录监狱 / docker 容器)
+    pub sandbox: SandboxConfig,
     /// 界面事件轮询间隔(毫秒,默认 500):状态灯/日志/开销面板的拉取频率
     pub ui_refresh_ms: u64,
 }
@@ -43,7 +47,109 @@ impl Default for Config {
             prompts: vec![PromptPreset::default()],
             active_prompt: "default".into(),
             cost: CostConfig::default(),
+            agent: AgentConfig::default(),
+            sandbox: SandboxConfig::default(),
             ui_refresh_ms: 500,
+        }
+    }
+}
+
+/// SubAgent 子系统配置。
+///
+/// ⚠️ 缓存前缀纪律:模式的启停**绝不修改前缀区的引导文本**(AGENT_GUIDE 恒注入),
+/// 开关状态以「上下文尾部追加显式说明」的方式注入(如「用户已关闭沙箱助手」),
+/// 尾部本就是每轮变化区,不影响前缀缓存命中。GUI 保存配置即热重载(机器人自动重启)。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// QQ 操作模式总开关:主模型可用 [任务:QQ] 标记把 QQ 操作交给子助手
+    pub enable_qq_ops: bool,
+    /// 沙箱模式总开关:主模型可用 [任务:沙箱] 标记把文件/命令操作交给沙箱子助手
+    pub enable_sandbox: bool,
+    /// 沙箱后端: "jail" 轻量目录监狱(默认,零依赖) / "docker" Docker 容器(强隔离)
+    pub sandbox_backend: String,
+    /// 允许触发任务的群角色(逗号分隔,如 "owner,admin";空 = 仅白名单)
+    pub allowed_group_roles: String,
+    /// 允许触发任务的白名单 QQ(逗号分隔;私聊触发也走这里)
+    pub owner_whitelist: String,
+    /// 是否允许私聊触发任务(仍需白名单或系统管理员判定)
+    pub allow_private: bool,
+    /// 敏感工具(禁言/全体禁言/移出群/撤回)是否纳入目录:
+    /// 纳入时 GUI 红字警示 + 强制审批 + 仅群主/管理员发起的任务可用
+    pub sensitive_tools_enabled: bool,
+    /// 工具选择阶段(阶段1)输出预算 tokens
+    pub select_max_tokens: u32,
+    /// 执行阶段(阶段2)每轮输出预算 tokens
+    pub step_max_tokens: u32,
+    /// 任务完成摘要输出预算 tokens
+    pub summary_max_tokens: u32,
+    /// 执行阶段轮次上限(防失控烧钱)
+    pub max_rounds: u32,
+    /// 单步审批等待超时(秒;超时任务自动转为暂停)
+    pub approval_timeout_secs: u64,
+    /// 任务总超时(秒;超时自动停止)
+    pub task_timeout_secs: u64,
+    /// 完成后是否触发主模型主动汇报一次(汇报注入上下文并发送到来源会话)
+    pub report_on_complete: bool,
+    /// 任务完成摘要是否注入主模型上下文尾部(默认 true;供主模型后续接话)
+    pub inject_result: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            enable_qq_ops: true,
+            enable_sandbox: false,
+            sandbox_backend: "jail".into(),
+            allowed_group_roles: "owner,admin".into(),
+            owner_whitelist: String::new(),
+            allow_private: false,
+            sensitive_tools_enabled: true,
+            select_max_tokens: 256,
+            step_max_tokens: 512,
+            summary_max_tokens: 128,
+            max_rounds: 8,
+            approval_timeout_secs: 600,
+            task_timeout_secs: 1800,
+            report_on_complete: true,
+            inject_result: true,
+        }
+    }
+}
+
+/// 沙箱执行环境配置。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// 沙箱根目录(空 = 应用数据目录下的 sandbox/;Docker 后端为挂载到容器的目录)
+    pub root_dir: String,
+    /// 命令白名单(逗号分隔的可执行文件名;jail 后端生效,Docker 后端不限制)
+    pub cmd_allowlist: String,
+    /// 单条命令最大执行秒数(超时杀进程树)
+    pub cmd_timeout_secs: u64,
+    /// 内存上限 MB(jail 后端经 Windows Job Object 限制;0 = 不限制)
+    pub mem_limit_mb: u64,
+    /// CPU 时间上限秒(jail 后端经 Job Object 限制;0 = 不限制)
+    pub cpu_limit_secs: u64,
+    /// Docker 镜像(Docker 后端)
+    pub docker_image: String,
+    /// Docker 内存限制字符串,如 "512m"(Docker 后端)
+    pub docker_memory: String,
+    /// 任务结束后销毁沙箱(jail:删除任务目录;docker:rm 容器)
+    pub destroy_on_done: bool,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            root_dir: String::new(),
+            cmd_allowlist: "python,py,node,npm,npx,pwsh,powershell,cmd,sh,bash,git,curl,wget,ffmpeg,tar,unzip,7z,7za".into(),
+            cmd_timeout_secs: 120,
+            mem_limit_mb: 1024,
+            cpu_limit_secs: 300,
+            docker_image: "python:3.12-alpine".into(),
+            docker_memory: "512m".into(),
+            destroy_on_done: true,
         }
     }
 }

@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::{AgentManager, AgentMode};
 use crate::chat::ChatCore;
 use crate::config::{self, Config, ModelConfig};
 use crate::cost::CostTracker;
@@ -43,6 +44,8 @@ pub struct AppState {
     pub placement: Arc<Mutex<PlacementController>>,
     /// 全局暂停回复:true 时只接收消息,不决策/不回复(机器人重启后复位)
     pub paused: Arc<AtomicBool>,
+    /// SubAgent 沙箱根目录基址(任务目录 = {dir}/{task_id})
+    pub sandbox_dir: PathBuf,
 }
 
 pub struct BotHandle {
@@ -93,6 +96,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         cost: Arc::new(Mutex::new(CostTracker::new(usage_dir))),
         placement: Arc::new(Mutex::new(PlacementController::default())),
         paused: Arc::new(AtomicBool::new(false)),
+        sandbox_dir: app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("sandbox"),
     });
     Ok(())
 }
@@ -221,6 +229,15 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
     let (decide_cancel, _) = watch::channel::<bool>(false);
     state.paused.store(false, Ordering::Relaxed);
 
+    // SubAgent 管理器(QQ 操作 / 沙箱两种模式;完成回调注入结果 + 触发主模型汇报)
+    let agent = Arc::new(AgentManager::new(
+        state.config.clone(),
+        state.events.clone(),
+        sender.clone(),
+        state.cost.clone(),
+        state.sandbox_dir.clone(),
+    ));
+
     let chat = Arc::new(ChatCore::new(
         state.config.clone(),
         sender,
@@ -231,7 +248,18 @@ async fn start_bot_inner(state: &tauri::State<'_, AppState>) -> Result<(), Strin
         state.placement.clone(),
         state.paused.clone(),
         decide_cancel,
+        Some(agent.clone()),
     ));
+    {
+        let chat_weak = Arc::downgrade(&chat);
+        agent.set_on_finished(Box::new(move |task| {
+            if let Some(chat) = chat_weak.upgrade() {
+                tauri::async_runtime::spawn(async move {
+                    chat.agent_finished(&task).await;
+                });
+            }
+        }));
+    }
 
     let mut tasks = Vec::new();
 
@@ -718,6 +746,90 @@ pub async fn approve_placement(
     } else {
         Ok(None)
     }
+}
+
+// ---------- SubAgent 命令 ----------
+
+fn agent_mgr(state: &tauri::State<'_, AppState>) -> Result<Arc<AgentManager>, String> {
+    let chat = state.chat.lock().map_err(|e| e.to_string())?;
+    chat.as_ref()
+        .and_then(|c| c.agent.clone())
+        .ok_or_else(|| "机器人未运行".to_string())
+}
+
+/// 任务列表(全量视图,前端直接渲染)
+#[tauri::command]
+pub async fn get_agent_tasks(state: tauri::State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let agent = agent_mgr(&state)?;
+    let tasks = agent.list().await;
+    Ok(tasks
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap_or_default())
+        .collect())
+}
+
+/// GUI 手动创建任务(可信,跳过角色校验;仍受模式开关控制)
+#[tauri::command]
+pub async fn spawn_agent_task(
+    state: tauri::State<'_, AppState>,
+    mode: String,
+    goal: String,
+) -> Result<String, String> {
+    let agent = agent_mgr(&state)?;
+    let mode = match mode.as_str() {
+        "sandbox" => AgentMode::Sandbox,
+        _ => AgentMode::QqOps,
+    };
+    agent.spawn_trusted(mode, &goal, "gui").await
+}
+
+/// 审批当前待审批步骤(每一步工具调用都必须用户亲自批准/拒绝)
+#[tauri::command]
+pub async fn approve_agent_step(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    step_id: String,
+) -> Result<(), String> {
+    let agent = agent_mgr(&state)?;
+    agent.approve_step(&task_id, &step_id).await
+}
+
+#[tauri::command]
+pub async fn reject_agent_step(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    step_id: String,
+) -> Result<(), String> {
+    let agent = agent_mgr(&state)?;
+    agent.reject_step(&task_id, &step_id).await
+}
+
+/// 暂停任务(冻结子 agent;主对话继续)
+#[tauri::command]
+pub async fn pause_agent(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
+    let agent = agent_mgr(&state)?;
+    agent.pause_task(&task_id).await
+}
+
+#[tauri::command]
+pub async fn resume_agent(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
+    let agent = agent_mgr(&state)?;
+    agent.resume_task(&task_id).await
+}
+
+#[tauri::command]
+pub async fn stop_agent(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
+    let agent = agent_mgr(&state)?;
+    agent.stop_task(&task_id).await
+}
+
+#[tauri::command]
+pub async fn remove_agent_task(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), String> {
+    let agent = agent_mgr(&state)?;
+    agent.remove_task(&task_id).await
 }
 
 // ---------- 状态展示 ----------

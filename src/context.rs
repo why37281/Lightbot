@@ -15,9 +15,7 @@ use crate::events::{MEMORY_GUIDE, THINKING_GUIDE};
 use crate::llm::ApiMessage;
 use crate::napcat::{MsgKind, ParsedMsg};
 use crate::session::{HistoryMsg, Session};
-use crate::trace::{self, TraceEvent};
-
-impl ChatCore {
+use crate::trace::{self, TraceEvent};impl ChatCore {
     /// 上下文预算管理:按记忆方案折叠 + 兜底头部截断(缓存友好)。
     pub(crate) async fn trim_context(&self, session: &mut Session, user_text: &str, turn: &str) {
         let (budget, summarize, summarize_tokens, ratio, prompt, mem_cfg, history_target, recent_cap, recent_keep) = {
@@ -35,10 +33,11 @@ impl ChatCore {
             )
         };
         let (prompt_tok, user_tok) = {
-            // 固定前缀 token:人设 + 记忆说明 + 思考约束(恒定) + 当前提问
+            // 固定前缀 token:人设 + 记忆说明 + 思考约束 + Agent 引导(恒定) + 当前提问
             let pt = (estimate_tokens(&prompt, ratio)
                 + estimate_tokens(MEMORY_GUIDE, ratio)
-                + estimate_tokens(THINKING_GUIDE, ratio)) as u64;
+                + estimate_tokens(THINKING_GUIDE, ratio)
+                + estimate_tokens(crate::agent::AGENT_GUIDE, ratio)) as u64;
             (pt, estimate_tokens(user_text, ratio) as u64)
         };
         // 记忆:刷新 + 超预算裁剪最旧条目(保护上下文预算)
@@ -187,8 +186,11 @@ impl ChatCore {
     }
 
     /// 组装消息流(缓存友好顺序,方案由 placement 决定):
-    /// 方案二(front):[人设][记忆说明][摘要][记忆][历史][轨迹][提问]
-    /// 方案一(back): [人设][记忆说明][摘要][历史][记忆][轨迹][提问]
+    /// 方案二(front):[人设][记忆说明][思考约束][Agent引导][摘要][记忆][历史][轨迹][提问][Agent尾部说明]
+    /// 方案一(back): [人设][记忆说明][思考约束][Agent引导][摘要][历史][记忆][轨迹][提问][Agent尾部说明]
+    ///
+    /// ⚠️ 缓存纪律:Agent 引导(AGENT_GUIDE)恒定注入、永不因开关变化;
+    /// 模式启停与任务结果只在「尾部」追加显式说明 —— 尾部本就是每轮变化区,不影响前缀命中。
     pub(crate) async fn build_messages(
         &self,
         session: &Session,
@@ -212,6 +214,10 @@ impl ChatCore {
             ApiMessage {
                 role: "system".into(),
                 content: THINKING_GUIDE.to_string(),
+            },
+            ApiMessage {
+                role: "system".into(),
+                content: crate::agent::AGENT_GUIDE.to_string(),
             },
         ];
         if let Some(s) = &session.summary {
@@ -280,6 +286,14 @@ impl ChatCore {
                 }
             }
         }
+        // SubAgent 尾部说明:模式启停状态 + 最近任务结果(位于提问之前,变化只影响尾部)
+        let tail = self.agent_tail_note(key).await;
+        if !tail.is_empty() {
+            msgs.push(ApiMessage {
+                role: "system".into(),
+                content: tail,
+            });
+        }
         // 当前提问:同样带时间与说话人前缀(与历史一致,模型好对齐)
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -290,6 +304,39 @@ impl ChatCore {
             content: format!("{}{}{}", ts_label(now_ts), speaker_prefix(msg.user_id), user_text),
         });
         msgs
+    }
+
+    /// SubAgent 尾部说明(仅追加在上下文末尾,绝不改动前缀区):
+    /// - 模式启停的显式说明(如「用户已关闭沙箱助手」);
+    /// - 最近一次任务结果摘要(供主模型接话汇报;TTL 内有效,由 chat.rs 写入)。
+    async fn agent_tail_note(&self, key: &str) -> String {
+        if self.agent.is_none() {
+            return String::new();
+        }
+        let (qq_on, sb_on) = {
+            let cfg = self.cfg.read().await;
+            (cfg.agent.enable_qq_ops, cfg.agent.enable_sandbox)
+        };
+        let mut notes: Vec<String> = Vec::new();
+        if !qq_on {
+            notes.push("(注意:用户已关闭 QQ 操作助手,不要使用 [任务:QQ] 标记。)".into());
+        }
+        if !sb_on {
+            notes.push("(注意:用户已关闭沙箱助手,不要使用 [任务:沙箱] 标记。)".into());
+        }
+        if let Some(note) = self.agent_notes.read().await.get(key) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if now - note.ts <= crate::chat::AGENT_NOTE_TTL_SECS {
+                notes.push(format!(
+                    "(子助手刚完成一个任务,结果摘要: {} —— 如果群友在问这件事,由你负责汇报。)",
+                    note.summary
+                ));
+            }
+        }
+        notes.join(" ")
     }
 }
 

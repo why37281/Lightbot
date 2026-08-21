@@ -60,6 +60,8 @@ function switchTab(name) {
     renderMemories();
   } else if (name === "overview") {
     refreshCost();
+  } else if (name === "agent") {
+    renderAgentTasks();
   }
 }
 
@@ -264,6 +266,11 @@ function handleEvent(ev) {
       break;
     }
     case "placement_proposal": showApprovalModal(ev.proposal); break;
+    case "agent_task_updated": renderAgentTasks(); break;
+    case "agent_log":
+      addLog("info", `🤖 [子任务 ${ev.task_id.slice(0, 8)}] ${ev.msg}`);
+      renderAgentTasks();
+      break;
   }
 }
 
@@ -307,6 +314,7 @@ async function loadConfig() {
   await refreshSessions();
   await renderMemories();
   await refreshCost();
+  await renderAgentTasks();
   startTickLoop();
   // 兜底:启动时若有未处理的切换提案(事件可能已错过),弹窗提醒
   try {
@@ -369,9 +377,37 @@ function bindConfigToForm() {
   $("#cfg-trail-window").value = c.trail.window_minutes;
   $("#cfg-trail-max").value = c.trail.max_entries;
   $("#cfg-trail-tokens").value = c.trail.max_tokens;
+  bindAgentConfig();
   syncModeFields();
   syncTrailModeFields();
   syncInterjectFields();
+}
+
+// SubAgent 配置绑定(cfg.agent / cfg.sandbox;热重载=保存后机器人自动重启)
+function bindAgentConfig() {
+  const a = cfg.agent || (cfg.agent = {});
+  const sb = cfg.sandbox || (cfg.sandbox = {});
+  $("#cfg-agent-qq").checked = !!a.enable_qq_ops;
+  $("#cfg-agent-sandbox").checked = !!a.enable_sandbox;
+  $("#cfg-sandbox-backend").value = a.sandbox_backend || "jail";
+  $("#cfg-agent-roles").value = a.allowed_group_roles || "owner,admin";
+  $("#cfg-agent-whitelist").value = a.owner_whitelist || "";
+  $("#cfg-agent-private").checked = !!a.allow_private;
+  $("#cfg-agent-sensitive").checked = a.sensitive_tools_enabled !== false;
+  $("#cfg-agent-report").checked = a.report_on_complete !== false;
+  $("#cfg-agent-inject").checked = a.inject_result !== false;
+  $("#cfg-agent-select-tok").value = a.select_max_tokens || 256;
+  $("#cfg-agent-step-tok").value = a.step_max_tokens || 512;
+  $("#cfg-agent-summary-tok").value = a.summary_max_tokens || 128;
+  $("#cfg-agent-rounds").value = a.max_rounds || 8;
+  $("#cfg-agent-approval-timeout").value = a.approval_timeout_secs || 600;
+  $("#cfg-agent-task-timeout").value = a.task_timeout_secs || 1800;
+  $("#cfg-sandbox-allowlist").value = sb.cmd_allowlist || "";
+  $("#cfg-sandbox-cmd-timeout").value = sb.cmd_timeout_secs || 120;
+  $("#cfg-sandbox-mem").value = sb.mem_limit_mb || 0;
+  $("#cfg-sandbox-image").value = sb.docker_image || "python:3.12-alpine";
+  $("#cfg-sandbox-docker-mem").value = sb.docker_memory || "512m";
+  $("#cfg-sandbox-destroy").checked = sb.destroy_on_done !== false;
 }
 
 function collectForm() {
@@ -428,9 +464,36 @@ function collectForm() {
   c.trail.window_minutes = parseInt($("#cfg-trail-window").value) || 5;
   c.trail.max_entries = parseInt($("#cfg-trail-max").value) || 10;
   c.trail.max_tokens = parseInt($("#cfg-trail-tokens").value) || 800;
+  collectAgentConfig();
   cfg.active_model = $("#cfg-active-model").value;
   cfg.active_prompt = $("#cfg-active-prompt").value;
   return cfg;
+}
+
+function collectAgentConfig() {
+  const a = cfg.agent || (cfg.agent = {});
+  const sb = cfg.sandbox || (cfg.sandbox = {});
+  a.enable_qq_ops = $("#cfg-agent-qq").checked;
+  a.enable_sandbox = $("#cfg-agent-sandbox").checked;
+  a.sandbox_backend = $("#cfg-sandbox-backend").value;
+  a.allowed_group_roles = $("#cfg-agent-roles").value.trim();
+  a.owner_whitelist = $("#cfg-agent-whitelist").value.trim();
+  a.allow_private = $("#cfg-agent-private").checked;
+  a.sensitive_tools_enabled = $("#cfg-agent-sensitive").checked;
+  a.report_on_complete = $("#cfg-agent-report").checked;
+  a.inject_result = $("#cfg-agent-inject").checked;
+  a.select_max_tokens = parseInt($("#cfg-agent-select-tok").value) || 256;
+  a.step_max_tokens = parseInt($("#cfg-agent-step-tok").value) || 512;
+  a.summary_max_tokens = parseInt($("#cfg-agent-summary-tok").value) || 128;
+  a.max_rounds = parseInt($("#cfg-agent-rounds").value) || 8;
+  a.approval_timeout_secs = parseInt($("#cfg-agent-approval-timeout").value) || 600;
+  a.task_timeout_secs = parseInt($("#cfg-agent-task-timeout").value) || 1800;
+  sb.cmd_allowlist = $("#cfg-sandbox-allowlist").value.trim();
+  sb.cmd_timeout_secs = parseInt($("#cfg-sandbox-cmd-timeout").value) || 120;
+  sb.mem_limit_mb = parseInt($("#cfg-sandbox-mem").value) || 0;
+  sb.docker_image = $("#cfg-sandbox-image").value.trim() || "python:3.12-alpine";
+  sb.docker_memory = $("#cfg-sandbox-docker-mem").value.trim() || "512m";
+  sb.destroy_on_done = $("#cfg-sandbox-destroy").checked;
 }
 
 function syncModeFields() {
@@ -1448,7 +1511,146 @@ async function slowSync() {
   await syncSessions();
   // 详情页打开时也顺带拉一次增量(tick 的 dirty 分支之外的兜底)
   if (detailState.key) await pollDetail();
+  await renderAgentTasks();
 }
+
+// ---------- 9. SubAgent 面板 ----------
+const AGENT_STATUS_LABEL = {
+  sandbox_setup: "沙箱搭建中", sandbox_activate: "沙箱激活中", selecting: "工具选择中",
+  awaiting_approval: "等待审批", executing: "执行中", paused: "已暂停",
+  done: "已完成", failed: "失败", stopped: "已停止",
+};
+const AGENT_MODE_LABEL = { qq_ops: "QQ 操作", sandbox: "沙箱" };
+const AGENT_STATUS_CLASS = {
+  sandbox_setup: "st-run", sandbox_activate: "st-run", selecting: "st-run",
+  awaiting_approval: "st-approval", executing: "st-run", paused: "st-paused",
+  done: "st-done", failed: "st-fail", stopped: "st-stop",
+};
+let agentTasks = [];
+
+function agentShortId(id) { return id ? String(id).slice(0, 8) : "?"; }
+
+async function renderAgentTasks() {
+  let list = [];
+  try { list = await invoke("get_agent_tasks"); } catch (e) { return; }
+  agentTasks = list;
+  const box = $("#agent-task-list");
+  if (!box) return;
+  if (!list.length) {
+    box.innerHTML = `<div class="agent-empty">暂无任务。QQ 里让主模型输出 [任务:QQ ...] / [任务:沙箱 ...] 标记,或在上方手动创建。</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const t of list) box.appendChild(agentTaskCard(t));
+}
+
+function fmtTs(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function agentTaskCard(t) {
+  const card = document.createElement("div");
+  card.className = "agent-card";
+  const statusCls = AGENT_STATUS_CLASS[t.status] || "st-run";
+  const statusLabel = AGENT_STATUS_LABEL[t.status] || t.status;
+  const origin = t.origin || {};
+  const originText = origin.kind === "group"
+    ? `群 ${origin.group_id}`
+    : (origin.kind === "private" ? "私聊" : "GUI");
+  const sens = (t.pending && t.pending.sensitive) ? `<span class="agent-sens">🔴 敏感操作</span>` : "";
+  const pendingHtml = t.pending ? `
+    <div class="agent-pending">
+      <div class="agent-pending-head">📋 待审批步骤 <span class="agent-pending-note">${escapeHtml(t.pending.note || "")}</span> ${sens}</div>
+      <div class="agent-pending-tool">工具: <code>${escapeHtml(t.pending.tool)}</code>
+        <span class="muted">(${escapeHtml(t.pending.permission || "")})</span></div>
+      <pre class="agent-pending-params">${escapeHtml(JSON.stringify(t.pending.params, null, 2))}</pre>
+      <div class="agent-pending-actions">
+        <button class="btn accent small" data-act="approve" data-task="${escapeHtml(t.id)}" data-step="${escapeHtml(t.pending.step_id)}">✅ 批准执行</button>
+        <button class="btn danger small" data-act="reject" data-task="${escapeHtml(t.id)}" data-step="${escapeHtml(t.pending.step_id)}">❌ 拒绝</button>
+      </div>
+    </div>` : "";
+  const stepsHtml = t.steps && t.steps.length ? `
+    <details class="agent-steps">
+      <summary>执行记录(${t.steps.length} 步)</summary>
+      ${t.steps.map((s) => `
+        <div class="agent-step ${s.ok ? "" : "agent-step-bad"}">
+          <code>${escapeHtml(s.tool)}</code> ${s.ok ? "✅" : "❌"}
+          <span class="muted">${escapeHtml((s.result || "").slice(0, 200))}</span>
+        </div>`).join("")}
+    </details>` : "";
+  const controls = [];
+  const terminal = ["done", "failed", "stopped"].includes(t.status);
+  if (t.status === "paused") {
+    controls.push(`<button class="btn small" data-act="resume" data-task="${escapeHtml(t.id)}">▶ 恢复</button>`);
+  } else if (!terminal) {
+    controls.push(`<button class="btn small" data-act="pause" data-task="${escapeHtml(t.id)}">⏸ 暂停</button>`);
+  }
+  if (!terminal) {
+    controls.push(`<button class="btn danger small" data-act="stop" data-task="${escapeHtml(t.id)}">⛔ 停止</button>`);
+  } else {
+    controls.push(`<button class="btn small" data-act="remove" data-task="${escapeHtml(t.id)}">🗑 移除</button>`);
+  }
+  card.innerHTML = `
+    <div class="agent-card-head">
+      <span class="capsule ${statusCls}">${statusLabel}</span>
+      <b class="agent-mode">${AGENT_MODE_LABEL[t.mode] || t.mode}</b>
+      <span class="muted">${escapeHtml(originText)} · 发起者 ${origin.user_id || "-"}(${escapeHtml(origin.requester_role || "-")})</span>
+      <span class="spacer"></span>
+      <span class="muted">轮次 ${t.rounds}/${t.max_rounds} · ${fmtTs(t.created_ts)}</span>
+    </div>
+    <div class="agent-goal">🎯 ${escapeHtml(t.goal)}</div>
+    ${t.selected_tools && t.selected_tools.length ? `<div class="agent-tools">🔧 已选工具: ${t.selected_tools.map((x) => `<code>${escapeHtml(x)}</code>`).join(" ")}</div>` : ""}
+    ${t.sandbox_backend ? `<div class="agent-sb">📦 沙箱后端: ${escapeHtml(t.sandbox_backend)}</div>` : ""}
+    ${pendingHtml}
+    ${stepsHtml}
+    ${t.summary ? `<div class="agent-summary">🏁 结果: ${escapeHtml(t.summary)}</div>` : ""}
+    ${t.error ? `<div class="agent-error">❌ ${escapeHtml(t.error)}</div>` : ""}
+    <div class="agent-card-actions">${controls.join("")}</div>`;
+  return card;
+}
+
+$("#agent-task-list")?.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const taskId = btn.dataset.task;
+  const stepId = btn.dataset.step;
+  const label = { approve: "批准", reject: "拒绝", pause: "暂停", resume: "恢复", stop: "停止", remove: "移除" }[act] || act;
+  try {
+    if (act === "approve") await invoke("approve_agent_step", { taskId, stepId });
+    else if (act === "reject") await invoke("reject_agent_step", { taskId, stepId });
+    else if (act === "pause") await invoke("pause_agent", { taskId });
+    else if (act === "resume") await invoke("resume_agent", { taskId });
+    else if (act === "stop") {
+      if (!confirm("确定停止该任务?未完成部分将被丢弃。")) return;
+      await invoke("stop_agent", { taskId });
+    } else if (act === "remove") await invoke("remove_agent_task", { taskId });
+    addLog("info", `🤖 [子任务 ${agentShortId(taskId)}] ${label}成功`);
+    await renderAgentTasks();
+  } catch (err) {
+    addLog("warn", `🤖 [子任务 ${agentShortId(taskId)}] ${label}失败: ${err}`);
+    await renderAgentTasks();
+  }
+});
+
+$("#btn-agent-create")?.addEventListener("click", async () => {
+  const mode = $("#agent-create-mode").value;
+  const goal = $("#agent-create-goal").value.trim();
+  if (!goal) { alert("请填写任务目标"); return; }
+  try {
+    const id = await invoke("spawn_agent_task", { mode, goal });
+    addLog("info", `🤖 已手动创建任务(${mode}): ${goal} id=${agentShortId(id)}`);
+    $("#agent-create-goal").value = "";
+    await renderAgentTasks();
+  } catch (e) {
+    alert("创建失败: " + e);
+  }
+});
+
+$("#btn-agent-refresh")?.addEventListener("click", renderAgentTasks);
 
 // ---------- 初始化 ----------
 loadConfig().catch((e) => {
