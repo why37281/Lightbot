@@ -12,7 +12,7 @@
 
 <div id="app">
   <header id="topbar">
-    <div class="brand">💡 LightBot</div>
+    <div class="brand"><span class="brand-logo">💡</span><span class="brand-name">LightBot</span></div>
     <div class="top-status">
       <span id="st-dot" class="dot gray"></span>
       <span id="st-text">未启动</span>
@@ -26,13 +26,13 @@
 
   <aside id="sidebar">
     <nav>
-      <a data-tab="overview" class="active">总览</a>
-      <a data-tab="sessions">会话与记忆</a>
-      <a data-tab="napcat">连接设置</a>
-      <a data-tab="models">模型设置</a>
-      <a data-tab="chat">会话设置</a>
-      <a data-tab="prompts">人设管理</a>
-      <a data-tab="logs">日志与通知</a>
+      <a data-tab="overview" class="active"><svg class="nav-ico" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>总览</a>
+      <a data-tab="sessions"><svg class="nav-ico" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>会话与记忆</a>
+      <a data-tab="napcat"><svg class="nav-ico" viewBox="0 0 24 24"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>连接设置</a>
+      <a data-tab="models"><svg class="nav-ico" viewBox="0 0 24 24"><rect x="4" y="9" width="16" height="11" rx="2.5"/><path d="M12 9V5"/><circle cx="12" cy="3.5" r="1.5"/><path d="M9 14h.01"/><path d="M15 14h.01"/><path d="M9.5 17.5h5"/></svg>模型设置</a>
+      <a data-tab="chat"><svg class="nav-ico" viewBox="0 0 24 24"><path d="M21 4h-8"/><path d="M9 4H3"/><path d="M21 12h-4"/><path d="M13 12H3"/><path d="M21 20h-9"/><path d="M8 20H3"/><path d="M13 2v4"/><path d="M17 10v4"/><path d="M12 18v4"/></svg>会话设置</a>
+      <a data-tab="prompts"><svg class="nav-ico" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>人设管理</a>
+      <a data-tab="logs"><svg class="nav-ico" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h5"/></svg>日志与通知</a>
     </nav>
     <div class="side-foot">
       <div class="side-ver">LightBot v1.0.0</div>
@@ -108,9 +108,9 @@
       <details class="settings-section" open>
         <summary>会话列表</summary>
         <div class="section-body">
-          <div class="actions" style="margin-top:0">
+          <div class="actions top">
             <button id="btn-refresh-sessions" class="btn small">刷新</button>
-            <span class="muted" style="font-size:12px">点击行打开详情:消息 / 思考 / 决策 / 回复时间线,可编辑删除与停止</span>
+            <span class="muted hint-sm">点击行打开详情:消息 / 思考 / 决策 / 回复时间线,可编辑删除与停止</span>
           </div>
           <table id="session-table">
             <thead><tr><th>状态</th><th>会话</th><th>消息数</th><th>约 tokens</th><th>摘要</th><th></th></tr></thead>
@@ -121,11 +121,11 @@
       <details class="settings-section">
         <summary>长期记忆</summary>
         <div class="section-body">
-          <div class="actions" style="margin-top:0">
+          <div class="actions top">
             <button id="btn-refresh-mem" class="btn small">刷新记忆列表</button>
           </div>
           <div id="memory-list"></div>
-          <div class="tips" style="margin-top:10px">
+          <div class="tips inline">
             <p>💡 模型通过回复末尾 <code>[记忆:添加 xxx]</code> 标记自动写入;QQ 里可用 <code>/remember</code> <code>/forget</code> <code>/memories</code> 管理。记忆机制的开关与上限在「会话设置 → 长期记忆」。</p>
           </div>
         </div>
@@ -224,7 +224,7 @@
     <!-- 会话设置(纯设置) -->
     <section id="tab-chat" class="tab">
       <h2>会话设置</h2>
-      <p class="muted" style="margin-bottom:12px;font-size:12.5px">按小节展开配置;所有改动需点右上角「保存配置」生效(运行中会自动重启机器人)。</p>
+      <p class="muted page-hint">按小节展开配置;所有改动需点右上角「保存配置」生效(运行中会自动重启机器人)。</p>
 
       <details class="settings-section" open>
         <summary>基础与上下文</summary>
@@ -493,6 +493,7 @@
 <!-- 保存结果浮层提示 -->
 <div id="save-toast" class="hidden"></div>
 
+<script src="_mock.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

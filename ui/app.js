@@ -303,7 +303,7 @@ async function loadConfig() {
   paused = !!sv.paused;
   updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error, paused });
   updatePausedUi();
-  $("#btn-toggle").textContent = running ? "停止" : "启动";
+  updateToggleBtn();
   await refreshSessions();
   await renderMemories();
   await refreshCost();
@@ -512,6 +512,13 @@ function setResult(text, cls) {
 }
 
 // ---------- 启动/停止 ----------
+// 启动/停止按钮:文案与样式随运行状态切换(运行中=红色「停止」警示态)
+function updateToggleBtn() {
+  const btn = $("#btn-toggle");
+  btn.textContent = running ? "停止" : "启动";
+  btn.classList.toggle("running", running);
+}
+
 $("#btn-toggle").addEventListener("click", async () => {
   const btn = $("#btn-toggle");
   btn.disabled = true;
@@ -530,7 +537,7 @@ $("#btn-toggle").addEventListener("click", async () => {
     running = !running;
     paused = false;
     updatePausedUi();
-    btn.textContent = running ? "停止" : "启动";
+    updateToggleBtn();
     $("#ov-running").textContent = running ? "运行中" : "未启动";
     // 启动/停止后立即对账真实状态(invoke 返回即后端已就绪;后续连接变化由 status 事件驱动)
     await slowSync();
@@ -698,7 +705,7 @@ function renderPrompts() {
       <div class="item-grid">
         <label>ID<input data-f="id" value="${escapeHtml(p.id)}" /></label>
         <label>名称<input data-f="name" value="${escapeHtml(p.name)}" /></label>
-        <label style="grid-column: 1 / -1">System Prompt<textarea data-f="prompt">${escapeHtml(p.prompt)}</textarea></label>
+        <label class="span-all">System Prompt<textarea data-f="prompt">${escapeHtml(p.prompt)}</textarea></label>
       </div>`;
     list.appendChild(card);
   });
@@ -815,6 +822,10 @@ async function refreshSessions() {
     });
     tbody.appendChild(tr);
   }
+  // 空状态:无活跃会话时给出一行占位提示(带 .empty-row,样式在 style.css)
+  if (!list.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="6">暂无活跃会话 · 机器人运行后,QQ 里的对话会出现在这里</td></tr>`;
+  }
 }
 
 // 点击任意位置关闭 ⋯ 菜单
@@ -838,16 +849,16 @@ async function renderMemories() {
     const kind = s.key.startsWith("g") ? "群" : "私聊";
     let rows = "";
     for (const e of s.entries) {
-      rows += `<div class="kv">
+      rows += `<div class="kv mem-row">
         <span>${e.index}. [${e.source === "model" ? "自动" : "用户"} ${e.date}] ${escapeHtml(e.text)}</span>
         <button class="btn small danger del-mem" data-key="${escapeHtml(s.key)}" data-idx="${e.index}">删</button>
       </div>`;
     }
     card.innerHTML = `
       <div class="item-head"><b>${kind} ${escapeHtml(s.key.slice(1))}</b><span class="badge">${s.entries.length} 条</span></div>
-      <div style="display:flex;flex-direction:column;gap:6px">${rows}</div>
-      <div class="add-mem-row" style="display:flex;gap:8px;margin-top:10px">
-        <input type="text" class="mem-text" placeholder="添加记忆…" style="flex:1" />
+      <div class="mem-rows">${rows}</div>
+      <div class="add-mem-row">
+        <input type="text" class="mem-text" placeholder="添加记忆…" />
         <button class="btn small add-mem" data-key="${escapeHtml(s.key)}">添加</button>
       </div>`;
     box.appendChild(card);
@@ -902,7 +913,7 @@ async function refreshCost() {
     `${(t.cache_hit || 0).toLocaleString()} / ${(t.cache_miss || 0).toLocaleString()}`;
   $("#cost-yuan").textContent = "¥ " + t.cost.toFixed(4);
   const walletEl = $("#cost-wallet");
-  walletEl.textContent = `¥ ${d.remaining.toFixed(4)}(余额 ¥${d.wallet_balance.toFixed(2)})`;
+  walletEl.textContent = `¥ ${d.remaining.toFixed(4)} (余额 ¥${d.wallet_balance.toFixed(2)})`;
   walletEl.classList.toggle("neg", d.remaining < 0);
 
   // 条形图:按类别展示 命中 / 未命中 / 输出 的堆叠条
@@ -926,7 +937,7 @@ async function refreshCost() {
     box.appendChild(row);
   }
   if (!cats.length) {
-    box.innerHTML = '<div class="muted" style="font-size:12px;padding:6px 0">今天还没有模型调用。</div>';
+    box.innerHTML = '<div class="panel-empty">今天还没有模型调用。</div>';
   }
 }
 
@@ -1440,7 +1451,7 @@ async function slowSync() {
     const sv = await invoke("get_status_view");
     running = !!sv.running;
     paused = !!sv.paused;
-    $("#btn-toggle").textContent = running ? "停止" : "启动";
+    updateToggleBtn();
     updateStatusView({ connected: sv.connected, mode: sv.mode, endpoint: sv.endpoint, self_id: sv.self_id, last_error: sv.last_error, paused });
     updatePausedUi();
     $("#ov-running").textContent = running ? "运行中" : "未启动";
