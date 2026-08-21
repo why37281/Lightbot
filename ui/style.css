@@ -198,6 +198,7 @@ h3 { font-size: 14px; margin: 18px 0 10px; color: var(--muted); }
 
 /* 卡片 */
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.cost-panel { max-width: none; margin-top: 14px; }
 .card {
   background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
   padding: 15px 16px; box-shadow: var(--shadow-sm);
@@ -282,7 +283,8 @@ h3 { font-size: 14px; margin: 18px 0 10px; color: var(--muted); }
 .form-grid label, label.check { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
 label.check { flex-direction: row; align-items: center; gap: 8px; cursor: pointer; transition: color .15s ease; }
 label.check:hover { color: var(--text); }
-input[type="text"], input[type="number"], input[type="password"], select, textarea {
+/* 文本类输入统一样式(含不带 type 属性的裸 input:模型卡/人设卡里动态生成的输入框) */
+input:not([type="checkbox"]), select, textarea {
   background: var(--bg); border: 1px solid var(--border); border-radius: 9px;
   color: var(--text); padding: 8px 11px; font-size: 13px; outline: none; width: 100%;
   transition: border-color .15s ease, box-shadow .15s ease;
@@ -370,6 +372,9 @@ label.disabled-field { opacity: .5; }
 
 /* 会话表 */
 table { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 13px; }
+#session-table { margin-top: 12px; }
+#memory-list { margin-top: 12px; }
+#model-list, #prompt-list { margin-top: 14px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; font-size: 11.5px; letter-spacing: .4px; }
 td { font-variant-numeric: tabular-nums; }

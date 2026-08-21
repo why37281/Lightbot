@@ -603,10 +603,10 @@ function renderModels() {
         <button class="btn small danger del-model" data-i="${i}">删除</button>
       </div>
       <div class="item-grid">
-        <label>名称<input data-f="name" value="${escapeHtml(m.name)}" /></label>
-        <label>API 地址<input data-f="base_url" value="${escapeHtml(m.base_url)}" /></label>
-        <label>API Key<input data-f="api_key" type="password" value="${escapeHtml(m.api_key)}" /></label>
-        <label>模型名<input data-f="model" value="${escapeHtml(m.model)}" /></label>
+        <label>名称<input type="text" data-f="name" value="${escapeHtml(m.name)}" /></label>
+        <label>API 地址<input type="text" data-f="base_url" value="${escapeHtml(m.base_url)}" /></label>
+        <label>API Key<input type="password" data-f="api_key" value="${escapeHtml(m.api_key)}" /></label>
+        <label>模型名<input type="text" data-f="model" value="${escapeHtml(m.model)}" /></label>
         <label>思考模式<select data-f="thinking"><option value="auto" ${m.thinking === "auto" ? "selected" : ""}>自动(模型默认)</option><option value="enabled" ${m.thinking === "enabled" ? "selected" : ""}>开启</option><option value="disabled" ${m.thinking === "disabled" ? "selected" : ""}>关闭</option></select></label>
         <label>推理强度(思考时生效)<select data-f="reasoning_effort"><option value="low" ${m.reasoning_effort === "low" ? "selected" : ""}>低</option><option value="high" ${m.reasoning_effort === "high" ? "selected" : ""}>高(默认)</option><option value="max" ${m.reasoning_effort === "max" ? "selected" : ""}>最高</option></select></label>
         <label>温度<input data-f="temperature" type="number" step="0.1" min="0" max="2" value="${m.temperature}" /></label>
@@ -703,8 +703,8 @@ function renderPrompts() {
         <button class="btn small danger del-prompt" data-i="${i}">删除</button>
       </div>
       <div class="item-grid">
-        <label>ID<input data-f="id" value="${escapeHtml(p.id)}" /></label>
-        <label>名称<input data-f="name" value="${escapeHtml(p.name)}" /></label>
+        <label>ID<input type="text" data-f="id" value="${escapeHtml(p.id)}" /></label>
+        <label>名称<input type="text" data-f="name" value="${escapeHtml(p.name)}" /></label>
         <label class="span-all">System Prompt<textarea data-f="prompt">${escapeHtml(p.prompt)}</textarea></label>
       </div>`;
     list.appendChild(card);
